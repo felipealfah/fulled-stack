@@ -1,0 +1,116 @@
+# Stack FullED Data — colar no Portainer como nova Stack
+# Inclui: Postgres, FastAPI, Metabase, pgAdmin
+#
+# Pré-requisitos no VPS:
+#   - Rede proxy_net criada (já existe com Caddy/Kestra)
+#   - Imagem fulled-api buildada ou via GitHub (ver abaixo)
+#
+# Caddy config (adicionar):
+#   api.fulled.com.br        → fulled-api:8000
+#   metabase.fulled.com.br   → fulled-metabase:3000
+#   pgadmin.fulled.com.br    → fulled-pgadmin:80
+
+name: fulled-data
+
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: fulled-postgres
+    environment:
+      POSTGRES_DB: fulled
+      POSTGRES_USER: fulled
+      POSTGRES_PASSWORD: FullED2026!
+      # Cria banco metabase automaticamente no primeiro boot
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fulled -d fulled"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - proxy_net
+
+  api:
+    image: ghcr.io/felipealfah/fulled-api:latest
+    # Se ainda não tiver imagem publicada, use build local:
+    # build:
+    #   context: ./Full_AIOS_Worker/api
+    container_name: fulled-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgres://fulled:FullED2026!@postgres:5432/fulled
+      KESTRA_URL: https://kestra.fulled.com.br
+      KESTRA_USER: felipe@fulled.com.br
+      KESTRA_PASSWORD: Fu112020!2026
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - proxy_net
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: fulled-metabase
+    ports:
+      - "3001:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: fulled
+      MB_DB_PASS: FullED2026!
+      MB_DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - proxy_net
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: fulled-pgadmin
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: felipe@fulled.com.br
+      PGADMIN_DEFAULT_PASSWORD: FullED2026!
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - proxy_net
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: fulled-watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /root/.docker/config.json:/config.json
+    environment:
+      WATCHTOWER_POLL_INTERVAL: 60
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_SCOPE: fulled-data
+    command: --scope fulled-data
+    restart: unless-stopped
+    networks:
+      - proxy_net
+
+volumes:
+  pgdata:
+  pgadmin_data:
+
+networks:
+  proxy_net:
+    external: true
