@@ -15,6 +15,7 @@ router = APIRouter(prefix="/pesquisas", tags=["review"])
 
 _BQ_PROJECT = "gifted-slice-357413"
 _BQ_SILVER_KW_PLAN = f"{_BQ_PROJECT}.leadgen_silver.kw_plan"
+_BQ_GOLD_KW_PLAN = f"{_BQ_PROJECT}.leadgen_gold.kw_plan"
 _BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
 _bq_client: bigquery.Client | None = None
 
@@ -47,6 +48,15 @@ def _insert_kw_plan_silver(client: bigquery.Client, rows: list[dict]) -> None:
         print(f"[WARN] BQ kw_plan silver errors: {errors}", file=sys.stderr)
     else:
         print(f"[bq] INSERT {len(rows)} rows em {_BQ_SILVER_KW_PLAN}")
+
+
+def _insert_kw_plan_gold(client: bigquery.Client, rows: list[dict]) -> None:
+    """INSERT síncrono em leadgen_gold.kw_plan — chamado via run_in_executor."""
+    errors = client.insert_rows_json(_BQ_GOLD_KW_PLAN, rows)
+    if errors:
+        print(f"[WARN] BQ kw_plan gold errors: {errors}", file=sys.stderr)
+    else:
+        print(f"[bq] INSERT {len(rows)} rows em {_BQ_GOLD_KW_PLAN}")
 
 
 class KeywordUpdate(BaseModel):
@@ -372,6 +382,110 @@ async def reject_pesquisa(pesquisa_id: str):
         )
 
     return {"ok": True, "message": f"Pesquisa {pesquisa_id} rejeitada e removida do staging"}
+
+
+@router.post("/{pesquisa_id}/promote-gold")
+async def promote_gold(pesquisa_id: str):
+    """Gate 2 do Board — promove keywords aprovadas para leadgen_gold.kw_plan.
+
+    Requer que a pesquisa já esteja com status='aprovado' (Gate 1 concluído).
+    Idealmente chamado após /competitive-intel ter enriquecido as keywords com
+    competitive_score e difficulty_label.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        pesquisa = await conn.fetchrow(
+            "SELECT * FROM pesquisas WHERE id = $1", pesquisa_id
+        )
+        if not pesquisa:
+            raise HTTPException(404, "Pesquisa não encontrada")
+
+        if pesquisa["status"] != "aprovado":
+            raise HTTPException(
+                400,
+                f"Pesquisa não está com status 'aprovado' (status atual: {pesquisa['status']}) "
+                "— realize o Gate 1 (approve-gate2) antes de promover para gold",
+            )
+
+        kw_rows = await conn.fetch(
+            """
+            SELECT
+                ks.keyword,
+                ks.avg_monthly_searches,
+                ks.competition,
+                ks.competition_index,
+                ks.cpc_low_brl,
+                ks.cpc_high_brl,
+                ks.score            AS opportunity_score,
+                ks.go_nogo          AS recomendacao,
+                ks.kw_type          AS tipo,
+                ks.competitive_score,
+                ks.difficulty_label,
+                ks.board_note,
+                p.id::text          AS pesquisa_id,
+                p.nicho,
+                p.cidade,
+                p.geo_target_id,
+                p.projeto_nome,
+                proj.metadata->>'dominio' AS projeto_url
+            FROM kw_staging ks
+            JOIN pesquisas p ON p.id = ks.pesquisa_id
+            LEFT JOIN projetos proj ON proj.id = p.projeto_id
+            WHERE ks.pesquisa_id = $1
+              AND UPPER(COALESCE(ks.kw_type, '')) != 'DESCARTA'
+              AND ks.go_nogo = 'GO'
+            """,
+            pesquisa_id,
+        )
+
+    aprovado_em = datetime.now(timezone.utc).isoformat()
+    rows_bq = []
+    for row in kw_rows:
+        d = dict(row)
+        rows_bq.append({
+            "pesquisa_id":          d["pesquisa_id"],
+            "nicho":                d["nicho"],
+            "cidade":               d["cidade"],
+            "geo_target_id":        d.get("geo_target_id"),
+            "keyword":              d["keyword"],
+            "avg_monthly_searches": d.get("avg_monthly_searches"),
+            "competition":          d.get("competition"),
+            "competition_index":    d.get("competition_index"),
+            "cpc_low_brl":          float(d["cpc_low_brl"]) if d.get("cpc_low_brl") else None,
+            "cpc_high_brl":         float(d["cpc_high_brl"]) if d.get("cpc_high_brl") else None,
+            "opportunity_score":    float(d["opportunity_score"]) if d.get("opportunity_score") else None,
+            "recomendacao":         d.get("recomendacao"),
+            "tipo":                 d.get("tipo"),
+            "competitive_score":    float(d["competitive_score"]) if d.get("competitive_score") else None,
+            "difficulty_label":     d.get("difficulty_label"),
+            "board_note":           d.get("board_note"),
+            "projeto_nome":         d.get("projeto_nome"),
+            "projeto_url":          d.get("projeto_url"),
+            "gate2_status":         "go",
+            "aprovado_em":          aprovado_em,
+        })
+
+    bq_status = "ok"
+    bq = _get_bq_client()
+    if bq and rows_bq:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: _insert_kw_plan_gold(bq, rows_bq),
+            )
+        except Exception as e:
+            print(f"[WARN] Erro gravando BQ gold.kw_plan: {e}", file=sys.stderr)
+            bq_status = "warn"
+    elif not bq:
+        bq_status = "warn"
+
+    return {
+        "ok": True,
+        "pesquisa_id": pesquisa_id,
+        "keywords_promovidas": len(rows_bq),
+        "bq_status": bq_status,
+    }
 
 
 @router.get("/")
