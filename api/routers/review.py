@@ -1,8 +1,52 @@
+import asyncio
+import json
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException
+from google.cloud import bigquery
+from google.oauth2 import service_account
 from pydantic import BaseModel
 from db import get_pool
 
 router = APIRouter(prefix="/pesquisas", tags=["review"])
+
+_BQ_PROJECT = "gifted-slice-357413"
+_BQ_SILVER_KW_PLAN = f"{_BQ_PROJECT}.leadgen_silver.kw_plan"
+_BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
+_bq_client: bigquery.Client | None = None
+
+
+def _get_bq_client() -> bigquery.Client | None:
+    """Retorna singleton BQ client ou None se GCP_SC_KEY não configurada."""
+    global _bq_client
+    if _bq_client is not None:
+        return _bq_client
+    gcp_key_json = os.environ.get("GCP_SC_KEY")
+    if not gcp_key_json:
+        print("[WARN] GCP_SC_KEY não configurada — BQ writes desabilitados", file=sys.stderr)
+        return None
+    try:
+        key_info = json.loads(gcp_key_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            key_info, scopes=_BQ_SCOPES
+        )
+        _bq_client = bigquery.Client(project=_BQ_PROJECT, credentials=credentials)
+        return _bq_client
+    except Exception as e:
+        print(f"[WARN] Erro inicializando BQ client: {e}", file=sys.stderr)
+        return None
+
+
+def _insert_kw_plan_silver(client: bigquery.Client, rows: list[dict]) -> None:
+    """INSERT síncrono em leadgen_silver.kw_plan — chamado via run_in_executor."""
+    errors = client.insert_rows_json(_BQ_SILVER_KW_PLAN, rows)
+    if errors:
+        print(f"[WARN] BQ kw_plan silver errors: {errors}", file=sys.stderr)
+    else:
+        print(f"[bq] INSERT {len(rows)} rows em {_BQ_SILVER_KW_PLAN}")
 
 
 class KeywordUpdate(BaseModel):
@@ -73,8 +117,9 @@ async def update_keyword(pesquisa_id: str, keyword_id: int, body: KeywordUpdate)
     return {"ok": True}
 
 
-@router.post("/{pesquisa_id}/approve")
-async def approve_pesquisa(pesquisa_id: str, body: ApproveRequest):
+@router.post("/{pesquisa_id}/auto-advance")
+async def auto_advance_pesquisa(pesquisa_id: str):
+    """Chamado pelo agente kw_research ao concluir — dispara kw_validator sem interação do Board."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         pesquisa = await conn.fetchrow(
@@ -83,20 +128,11 @@ async def approve_pesquisa(pesquisa_id: str, body: ApproveRequest):
         if not pesquisa:
             raise HTTPException(404, "Pesquisa não encontrada")
 
-        # Marca keywords aprovadas
-        await conn.execute(
-            "UPDATE kw_staging SET status = 'approved' WHERE pesquisa_id = $1 AND keyword = ANY($2)",
-            pesquisa_id, body.approved_keywords,
-        )
-        # Marca pesquisa como aprovada
         await conn.execute(
             "UPDATE pesquisas SET status = 'approved', reviewed_at = NOW() WHERE id = $1",
             pesquisa_id,
         )
 
-    # Sinaliza para o polling container disparar o Agent 2+3 (kw_validator)
-    pool2 = await get_pool()
-    async with pool2.acquire() as conn:
         exec_id = await conn.fetchval(
             """INSERT INTO agent_executions
                (pesquisa_id, analysis_version, agent_name, status, started_at)
@@ -131,12 +167,15 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
 
         projeto_id = body.projeto_id
 
-        # Criar novo projeto a partir da pesquisa
+        # Criar novo projeto a partir da pesquisa (ou reusar se nome já existe)
         if body.criar_projeto and not projeto_id:
+            nome = pesquisa["projeto_nome"] or pesquisa["nicho"]
             row = await conn.fetchrow(
                 """INSERT INTO projetos (projeto_nome, nicho, cidade, status, pesquisa_id_atual)
-                   VALUES ($1, $2, $3, 'research', $4) RETURNING id""",
-                pesquisa["projeto_nome"] or pesquisa["nicho"],
+                   VALUES ($1, $2, $3, 'research', $4)
+                   ON CONFLICT (projeto_nome) DO UPDATE SET updated_at = NOW()
+                   RETURNING id""",
+                nome,
                 pesquisa["nicho"],
                 pesquisa["cidade"],
                 pesquisa_id,
@@ -150,29 +189,91 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
                 pesquisa_id, projeto_id,
             )
 
-        # Atualizar pesquisa
+        # Atualizar pesquisa — status 'aprovado' é o valor válido no check constraint
         await conn.execute(
             """UPDATE pesquisas
-               SET status = 'gate_2_approved', reviewed_at = NOW(), projeto_id = $2
+               SET status = 'aprovado', reviewed_at = NOW(), projeto_id = $2
                WHERE id = $1""",
             pesquisa_id, projeto_id,
         )
 
-        # Enfileirar kw_plan_builder para regenerar plano apos Gate 2 (D-05)
-        exec_id = await conn.fetchval(
-            """INSERT INTO agent_executions
-               (pesquisa_id, analysis_version, agent_name, status, started_at)
-               VALUES ($1, 1, 'kw_plan_builder', 'pending', NOW())
-               RETURNING id""",
-            pesquisa_id,
-        )
+    # Gravar keywords aprovadas em BQ leadgen_silver.kw_plan (espelho — Postgres é fonte de verdade)
+    bq = _get_bq_client()
+    if bq:
+        async with pool.acquire() as conn2:
+            kw_rows = await conn2.fetch(
+                """
+                SELECT
+                    ks.keyword,
+                    ks.avg_monthly_searches,
+                    ks.competition,
+                    ks.competition_index,
+                    ks.cpc_low_brl,
+                    ks.cpc_high_brl,
+                    ks.score           AS opportunity_score,
+                    ks.go_nogo         AS recomendacao,
+                    ks.go_nogo         AS board_go_nogo,
+                    ks.board_note,
+                    ks.kw_type         AS tipo,
+                    p.id::text         AS pesquisa_id,
+                    p.nicho,
+                    p.cidade,
+                    p.geo_target_id,
+                    p.created_at       AS pesquisado_em,
+                    p.projeto_nome,
+                    proj.metadata->>'dominio' AS projeto_url
+                FROM kw_staging ks
+                JOIN pesquisas p ON p.id = ks.pesquisa_id
+                LEFT JOIN projetos proj ON proj.id = $2
+                WHERE ks.pesquisa_id = $1
+                  AND UPPER(COALESCE(ks.kw_type, '')) != 'DESCARTA'
+                """,
+                pesquisa_id,
+                projeto_id,
+            )
+
+        promovido_em = datetime.now(timezone.utc).isoformat()
+        rows_bq = []
+        for row in kw_rows:
+            d = dict(row)
+            rows_bq.append({
+                "pesquisa_id":          d["pesquisa_id"],
+                "nicho":                d["nicho"],
+                "cidade":               d["cidade"],
+                "geo_target_id":        d.get("geo_target_id"),
+                "pesquisado_em":        d["pesquisado_em"].isoformat() if d.get("pesquisado_em") else None,
+                "keyword":              d["keyword"],
+                "avg_monthly_searches": d.get("avg_monthly_searches"),
+                "competition":          d.get("competition"),
+                "competition_index":    d.get("competition_index"),
+                "cpc_low_brl":          float(d["cpc_low_brl"]) if d.get("cpc_low_brl") else None,
+                "cpc_high_brl":         float(d["cpc_high_brl"]) if d.get("cpc_high_brl") else None,
+                "opportunity_score":    float(d["opportunity_score"]) if d.get("opportunity_score") else None,
+                "recomendacao":         d.get("recomendacao"),
+                "tipo":                 d.get("tipo"),
+                "board_go_nogo":        d.get("board_go_nogo"),
+                "board_note":           d.get("board_note"),
+                "projeto_nome":         d.get("projeto_nome"),
+                "projeto_url":          d.get("projeto_url"),
+                "monthly_volumes":      None,
+                "promovido_em":         promovido_em,
+            })
+
+        if rows_bq:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: _insert_kw_plan_silver(bq, rows_bq),
+                )
+            except Exception as e:
+                print(f"[WARN] Erro gravando BQ silver.kw_plan: {e}", file=sys.stderr)
 
     return {
         "ok": True,
         "pesquisa_id": pesquisa_id,
-        "status": "gate_2_approved",
+        "status": "aprovado",
         "projeto_id": projeto_id,
-        "agent_executions_id": str(exec_id),
     }
 
 

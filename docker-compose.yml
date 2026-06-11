@@ -70,6 +70,7 @@ services:
       MULTICA_API_URL: ${MULTICA_API_URL:-}
       MULTICA_PAT_TOKEN: ${MULTICA_PAT_TOKEN:-}
       MULTICA_WORKSPACE_ID: ${MULTICA_WORKSPACE_ID:-}
+      GCP_SC_KEY: ${GCP_SC_KEY:-}
     volumes:
       # Full_AIOS_Data esta fora do repo STACK — usar path absoluto
       - /Users/felipefull/Documents/Full_AIOS/Full_AIOS_Data:/data
