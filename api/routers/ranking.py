@@ -1,23 +1,24 @@
 """ranking.py — GET /projetos/{id}/ranking
 
-Le ranking_gold_{slug}.parquet via DuckDB e retorna JSON com metricas de ranking.
+Le ranking_dashboard e ranking_history do BigQuery (leadgen_gold).
+Phase 03: migrado de DuckDB/Parquet para BQ.
 
-Se arquivo nao existir: {"status": "not_ready", "message": "..."}
+Se dados nao existirem no BQ: {"status": "not_ready", "message": "..."}
 Se projeto nao existir: 404
-
-Slug gerado a partir de projeto_nome usando a mesma logica de utils.py (D-06).
-ATENCAO: se slugify() for alterado em utils.py, atualizar aqui tambem.
 """
 
+import json
 import math
+import os
 import re
 import unicodedata
 from pathlib import Path
 from typing import Optional
 
-import duckdb
 import pandas as pd
 from fastapi import APIRouter, HTTPException
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 from db import get_pool
 
@@ -25,28 +26,44 @@ router = APIRouter(prefix="/projetos", tags=["ranking"])
 
 DATA_DIR = Path("/data/leadgen")
 
+BQ_PROJECT_ID = "gifted-slice-357413"
+BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
+
+
+def _load_bq_client() -> bigquery.Client:
+    """Autentica SA leadgen-sc via GCP_SC_KEY env var."""
+    gcp_key_json = os.environ.get("GCP_SC_KEY") or os.environ.get("GCP_GADS_KEY")
+    if gcp_key_json:
+        key_info = json.loads(gcp_key_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            key_info, scopes=BQ_SCOPES
+        )
+        return bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials)
+    return bigquery.Client(project=BQ_PROJECT_ID)  # ADC fallback
+
 
 def _slugify(name: str) -> str:
-    """Normaliza projeto_nome -> slug Parquet. DEVE ser identica a utils.slugify().
+    """Normaliza projeto_nome -> slug. DEVE ser identica a utils.slugify().
 
     Copia intencional para evitar dependencia de modulo externo no container FastAPI.
     Se alterar utils.py, alterar aqui tambem.
 
     'Marido de Aluguel' -> 'marido_de_aluguel'
     """
-    # Remove acentos via NFD decomposition
     text = "".join(
         c for c in unicodedata.normalize("NFD", name.lower().strip())
         if unicodedata.category(c) != "Mn"
     )
-    text = re.sub(r"[^\w\s]", "", text)        # remove punctuation
-    text = re.sub(r"\s+", "_", text)            # spaces -> underscores
-    text = re.sub(r"_+", "_", text).strip("_")  # collapse multiple _
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
     return text
 
 
-def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> dict:
+def _compute_report(bq_client, projeto_id: int, projeto_nome: str) -> dict:
     """Calcula relatório de ranking comparando último snapshot vs penúltimo.
+
+    Lê de leadgen_gold.ranking_history via BQ (substitui Parquet + DuckDB).
 
     Modos:
     - baseline: apenas 1 snapshot_date distinto → deltas null
@@ -56,12 +73,22 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
     """
     from datetime import date
 
-    df = pd.read_parquet(history_path)
+    query = f"""
+        SELECT *
+        FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
+        WHERE projeto_id = @projeto_id
+        ORDER BY snapshot_date
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+    ])
+    bq_rows = list(bq_client.query(query, job_config=job_config).result())
+    if not bq_rows:
+        return {"status": "not_ready", "message": "Histórico ainda não disponível."}
 
-    # Garante coluna snapshot_date como date (pode vir como Timestamp)
+    df = pd.DataFrame([dict(r) for r in bq_rows])
     df["snapshot_date"] = pd.to_datetime(df["snapshot_date"]).dt.date
 
-    # Snapshots distintos ordenados DESC (mais recente primeiro)
     snapshot_dates = sorted(df["snapshot_date"].unique(), reverse=True)
     curr_date = snapshot_dates[0]
     prev_date = snapshot_dates[1] if len(snapshot_dates) >= 2 else None
@@ -70,7 +97,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
     curr_df = df[df["snapshot_date"] == curr_date].copy()
     prev_df = df[df["snapshot_date"] == prev_date].copy() if prev_date else None
 
-    # Helper para NaN → None
     def _safe(v):
         if v != v:  # NaN check
             return None
@@ -80,7 +106,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
         s = _safe(v)
         return int(s) if s is not None else None
 
-    # Contagens por status no snapshot atual
     def _count(status_val: str) -> int:
         return int((curr_df["status"] == status_val).sum())
 
@@ -89,7 +114,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
     gap = _count("GAP")
     surpresa = _count("SURPRESA")
 
-    # Deltas (None em baseline)
     rankeando_delta = None
     gap_delta = None
     surpresa_delta = None
@@ -102,7 +126,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
         gap_delta = gap - prev_gap
         surpresa_delta = surpresa - prev_surpresa
 
-    # top_rankeando: top 10 RANKEANDO por serp_position ASC
     top_df = curr_df[curr_df["status"] == "RANKEANDO"].sort_values("serp_position")
     top_rankeando = [
         {
@@ -114,13 +137,11 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
         for _, r in top_df.head(10).iterrows()
     ]
 
-    # fell, rose, new_surpresa: apenas em modo weekly
     fell = []
     rose = []
     new_surpresa = []
 
     if prev_df is not None:
-        # Merge pelo keyword para comparar posições
         merged = curr_df.merge(
             prev_df[["keyword", "serp_position", "status"]].rename(
                 columns={"serp_position": "serp_position_prev", "status": "status_prev"}
@@ -129,7 +150,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
             how="left",
         )
 
-        # fell: serp_position piorou >= 3 (número maior = posição pior)
         fell_df = merged.dropna(subset=["serp_position_prev"]).copy()
         fell_df = fell_df[fell_df["serp_position"].notna()]
         fell_df["delta"] = fell_df["serp_position"] - fell_df["serp_position_prev"]
@@ -144,7 +164,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
             for _, r in fell_df.iterrows()
         ]
 
-        # rose: serp_position melhorou >= 3 (número menor = posição melhor)
         rose_df = merged.dropna(subset=["serp_position_prev"]).copy()
         rose_df = rose_df[rose_df["serp_position"].notna()]
         rose_df["delta"] = rose_df["serp_position"] - rose_df["serp_position_prev"]
@@ -159,7 +178,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
             for _, r in rose_df.iterrows()
         ]
 
-        # new_surpresa: status SURPRESA no curr que não existia no prev OU era diferente
         prev_keywords = set(prev_df["keyword"].tolist())
         curr_surpresa = curr_df[curr_df["status"] == "SURPRESA"]
         new_surpresa = [
@@ -172,7 +190,6 @@ def _compute_report(history_path: Path, projeto_id: int, projeto_nome: str) -> d
             or prev_df[prev_df["keyword"] == r["keyword"]]["status"].values[0] != "SURPRESA"
         ]
 
-    # critical_gaps: sc_impressions_30d > 50 AND status != RANKEANDO
     crit_df = curr_df[
         (curr_df["status"] != "RANKEANDO")
         & (curr_df["sc_impressions_30d"].notna())
@@ -224,35 +241,37 @@ async def get_ranking(projeto_id: int):
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
 
-    slug = _slugify(row["projeto_nome"])
-    gold_path = DATA_DIR / "gold" / f"ranking_gold_{slug}.parquet"
+    bq = _load_bq_client()
+    query = f"""
+        SELECT *
+        FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_dashboard`
+        WHERE projeto_id = @projeto_id
+        ORDER BY status, serp_position NULLS LAST
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+    ])
+    try:
+        rows = list(bq.query(query, job_config=job_config).result())
+    except Exception as e:
+        raise HTTPException(503, f"Erro ao consultar BigQuery: {e}")
 
-    if not gold_path.exists():
+    if not rows:
         return {
             "status": "not_ready",
-            "message": "Ranking ainda não processado para este projeto. Aguarde o agente rank_intel.",
+            "message": "Ranking ainda não processado para este projeto. Execute o agente rank_intel.",
         }
 
-    # DuckDB: fresh connection per request (in-memory, read-only Parquet)
-    conn_duck = duckdb.connect()
-    try:
-        df = conn_duck.execute(
-            "SELECT * FROM read_parquet(?) ORDER BY status, serp_position NULLS LAST",
-            [str(gold_path)],
-        ).df()
-    finally:
-        conn_duck.close()
-
-    keywords = df.to_dict(orient="records")
-
-    # Substitui NaN (pandas) por None para serialização JSON correta
-    for kw in keywords:
+    keywords = []
+    for r in rows:
+        kw = dict(r)
         for k, v in kw.items():
-            if v != v:  # NaN check: NaN != NaN é True em Python
-                kw[k] = None
+            if hasattr(v, "isoformat"):
+                kw[k] = v.isoformat()
+        keywords.append(kw)
 
     from datetime import datetime, timezone
-    updated_at = datetime.fromtimestamp(gold_path.stat().st_mtime, tz=timezone.utc).isoformat()
+    updated_at = datetime.now(timezone.utc).isoformat()
 
     return {
         "status": "ok",
@@ -270,7 +289,6 @@ async def get_ranking_history(projeto_id: int, keyword: Optional[str] = None):
     """Retorna série histórica de posições por keyword.
 
     Query param opcional: keyword=<texto> — filtra para uma única keyword.
-    Lê ranking_history_{slug}.parquet via DuckDB e agrupa por keyword → series.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -281,62 +299,57 @@ async def get_ranking_history(projeto_id: int, keyword: Optional[str] = None):
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
 
-    slug = _slugify(row["projeto_nome"])
-    history_path = DATA_DIR / "gold" / f"ranking_history_{slug}.parquet"
+    bq = _load_bq_client()
+    if keyword:
+        query = f"""
+            SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
+            FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
+            WHERE projeto_id = @projeto_id AND keyword = @keyword
+            ORDER BY keyword, snapshot_date
+        """
+        params = [
+            bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+            bigquery.ScalarQueryParameter("keyword", "STRING", keyword),
+        ]
+    else:
+        query = f"""
+            SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
+            FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
+            WHERE projeto_id = @projeto_id
+            ORDER BY keyword, snapshot_date
+        """
+        params = [bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id)]
 
-    if not history_path.exists():
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    try:
+        rows = list(bq.query(query, job_config=job_config).result())
+    except Exception as e:
+        raise HTTPException(503, f"Erro ao consultar BigQuery: {e}")
+
+    if not rows:
         return {
             "status": "not_ready",
             "message": "Histórico ainda não disponível. Execute o pipeline rank_intel ao menos uma vez.",
         }
 
-    conn_duck = duckdb.connect()
-    try:
-        if keyword:
-            df = conn_duck.execute(
-                """
-                SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
-                FROM read_parquet(?)
-                WHERE keyword = ?
-                ORDER BY keyword, snapshot_date
-                """,
-                [str(history_path), keyword],
-            ).df()
-        else:
-            df = conn_duck.execute(
-                """
-                SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
-                FROM read_parquet(?)
-                ORDER BY keyword, snapshot_date
-                """,
-                [str(history_path)],
-            ).df()
-    finally:
-        conn_duck.close()
-
-    # Agrupa por keyword → series
     grouped: dict[str, list[dict]] = {}
-    for _, r in df.iterrows():
+    for r in rows:
         kw = r["keyword"]
         if kw not in grouped:
             grouped[kw] = []
         serp = r["serp_position"]
         sc = r["sc_position_avg_30d"]
+        snap = r["snapshot_date"]
         grouped[kw].append({
-            "date": str(r["snapshot_date"]),
-            "serp_position": None if (serp != serp or serp is None) else int(serp),
-            "sc_position": None if (sc != sc or sc is None) else round(float(sc), 1),
+            "date": snap.isoformat() if hasattr(snap, "isoformat") else str(snap),
+            "serp_position": None if serp is None else int(serp),
+            "sc_position": None if sc is None else round(float(sc), 1),
         })
-
-    keywords_out = [
-        {"keyword": kw, "series": series}
-        for kw, series in grouped.items()
-    ]
 
     return {
         "status": "ok",
         "projeto_id": projeto_id,
-        "keywords": keywords_out,
+        "keywords": [{"keyword": kw, "series": series} for kw, series in grouped.items()],
     }
 
 
@@ -345,7 +358,7 @@ async def get_ranking_report(projeto_id: int):
     """Relatório semanal de ranking: sumário atual + deltas vs snapshot anterior.
 
     Modos:
-    - not_ready: history parquet não existe (Phase 17 ainda não rodou)
+    - not_ready: histórico BQ vazio (rank_intel ainda não rodou)
     - baseline: apenas 1 snapshot_date → sem deltas
     - weekly: 2+ snapshots → deltas calculados
     """
@@ -358,17 +371,26 @@ async def get_ranking_report(projeto_id: int):
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
 
-    slug = _slugify(row["projeto_nome"])
-    history_path = DATA_DIR / "gold" / f"ranking_history_{slug}.parquet"
+    bq = _load_bq_client()
+    check_query = f"""
+        SELECT COUNT(*) as n
+        FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
+        WHERE projeto_id = @projeto_id
+    """
+    check_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+    ])
+    try:
+        n_rows = list(bq.query(check_query, job_config=check_config).result())[0]["n"]
+    except Exception as e:
+        raise HTTPException(503, f"Erro ao consultar BigQuery: {e}")
 
-    if not history_path.exists():
+    if n_rows == 0:
         return {
             "status": "not_ready",
-            "message": "Histórico de ranking ainda não disponível para este projeto. "
-                       "Aguarde o agente rank_intel gerar ao menos um snapshot.",
+            "message": "Histórico de ranking ainda não disponível. Execute rank_intel ao menos uma vez.",
         }
-
-    return _compute_report(history_path, projeto_id, row["projeto_nome"])
+    return _compute_report(bq, projeto_id, row["projeto_nome"])
 
 
 @router.get("/{projeto_id}/seo-yaml-template")
@@ -400,7 +422,6 @@ async def get_seo_yaml_template(projeto_id: int):
         if not proj:
             raise HTTPException(404, "Projeto não encontrado")
 
-        # Pesquisas aprovadas vinculadas ao projeto → fonte dos serviços (Gate 2)
         pesquisas = await conn.fetch(
             """
             SELECT DISTINCT nicho
@@ -420,11 +441,9 @@ async def get_seo_yaml_template(projeto_id: int):
         for p in pesquisas
     ]
 
-    # Cidades: parse do campo metadata (pode ser "Brasília, DF" ou "Brasília")
     cidade_raw = proj["cidade_meta"] or ""
     cidades = [c.strip() for c in cidade_raw.replace(";", ",").split(",") if c.strip()] or ["Brasília"]
 
-    # Monta YAML
     servicos_yaml = "\n".join(
         f"  - nome: {s['nome']}\n    slug: {s['slug']}" for s in servicos
     ) or "  # nenhuma pesquisa Gate 2 vinculada a este projeto"
