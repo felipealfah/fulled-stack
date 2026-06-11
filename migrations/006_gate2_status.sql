@@ -11,7 +11,7 @@ ALTER TABLE kw_staging
   ADD CONSTRAINT kw_staging_kw_type_check
   CHECK (kw_type IN (
     'principal', 'silo', 'geo', 'descarta',
-    'PAGINA_PRINCIPAL', 'PAGINA_GEO', 'SECAO', 'DESCARTA'
+    'PAGINA_PRINCIPAL', 'PAGINA_GEO', 'SECAO', 'DESCARTA', 'SERVICO'
   ));
 
 -- 2. Expandir pesquisas.status para incluir gate_2_pending e gate_2_approved
@@ -23,5 +23,6 @@ ALTER TABLE pesquisas
   ADD CONSTRAINT pesquisas_status_check
   CHECK (status IN (
     'pending_review', 'approved', 'rejected',
-    'gate_2_pending', 'gate_2_approved'
+    'gate_2_pending', 'gate_2_approved',
+    'aprovado', 'classificado'
   ));
