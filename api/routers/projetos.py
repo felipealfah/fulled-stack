@@ -1,9 +1,122 @@
+import asyncio
+import os
+import re
+import sys
+import unicodedata
+
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from db import get_pool
 import multica
 
 router = APIRouter(prefix="/projetos", tags=["projetos"])
+
+_SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+_SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+
+def _slugify(text: str) -> str:
+    """Gera slug a partir de texto (mesmo algoritmo da Edge Function criar-projeto)."""
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = text.lower().strip()
+    return re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+
+
+async def _sync_supabase(projeto_uuid: str, nome: str) -> bool:
+    """POST na REST API do Supabase com UUID externo.
+
+    Usa resolution=merge-duplicates para evitar 409 em re-sync (Pitfall 4).
+    Retorna True se HTTP 200/201, False caso contrário (best-effort).
+    asyncpg retorna uuid.UUID — chamar com str(row["id_uuid"]) (Pitfall 3).
+    """
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        print(
+            "[projetos] WARN: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configuradas — sync ignorado",
+            file=sys.stderr,
+        )
+        return False
+    slug = _slugify(nome)
+    headers = {
+        "apikey": _SUPABASE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal,resolution=merge-duplicates",
+    }
+    payload = {"id": projeto_uuid, "nome": nome, "slug": slug}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{_SUPABASE_URL}/rest/v1/projetos",
+                headers=headers,
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code not in (200, 201):
+                print(
+                    f"[projetos] Supabase sync HTTP {resp.status_code}: {resp.text[:200]}",
+                    file=sys.stderr,
+                )
+                return False
+            return True
+    except Exception as e:
+        print(f"[projetos] Supabase sync erro: {e}", file=sys.stderr)
+        return False
+
+
+def _sync_bq_map_sync(projeto_id_int: int, projeto_id_uuid: str, slug: str, nome: str) -> None:
+    """Registra mapeamento UUID→INT em leadgen_gold.projetos_id_map (best-effort, síncrono).
+
+    Chamado via loop.run_in_executor — não bloqueia o event loop.
+    Pré-requisito: bq_client.ensure_projetos_id_map() e migrate_bq_add_uuid_column()
+    já executados (Plan 04).
+    """
+    try:
+        from google.cloud import bigquery as bq
+        import json
+        import tempfile
+        from datetime import datetime, timezone
+
+        gcp_key_json = os.environ.get("GCP_SC_KEY", "")
+        if not gcp_key_json:
+            print(
+                "[projetos] WARN: GCP_SC_KEY não configurada — BQ map sync ignorado",
+                file=sys.stderr,
+            )
+            return
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(gcp_key_json)
+            key_path = f.name
+
+        client = bq.Client.from_service_account_json(key_path)
+        os.unlink(key_path)
+
+        table_ref = "gifted-slice-357413.leadgen_gold.projetos_id_map"
+        # DELETE+INSERT para idempotência (mesmo padrão de upsert_projetos_id_map em bq_client.py)
+        del_q = f"DELETE FROM `{table_ref}` WHERE id_int = @id_int"
+        jc = bq.QueryJobConfig(query_parameters=[
+            bq.ScalarQueryParameter("id_int", "INT64", projeto_id_int),
+        ])
+        client.query(del_q, job_config=jc).result()
+
+        row = {
+            "id_int": projeto_id_int,
+            "uuid": projeto_id_uuid,
+            "projeto_nome": nome,
+            "slug": slug,
+            "criado_em": datetime.now(timezone.utc).isoformat(),
+        }
+        cfg = bq.LoadJobConfig(write_disposition=bq.WriteDisposition.WRITE_APPEND)
+        job = client.load_table_from_json([row], table_ref, job_config=cfg)
+        job.result()
+        print(
+            f"[projetos] BQ projetos_id_map sync OK: id_int={projeto_id_int} uuid={projeto_id_uuid}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[projetos] WARN: BQ projetos_id_map sync falhou: {e}", file=sys.stderr)
 
 
 class ProjetoCreate(BaseModel):
@@ -96,6 +209,32 @@ async def create_projeto(body: ProjetoCreate):
             body.receita_mensal,
         )
     projeto = dict(row)
+
+    # Extrair UUID gerado pelo Postgres (Pitfall 3: asyncpg retorna uuid.UUID, não str)
+    projeto_uuid = str(projeto.get("id_uuid") or projeto["id"])
+
+    # Sincronizar UUID com Supabase CRM (best-effort)
+    supabase_ok = await _sync_supabase(projeto_uuid, projeto["projeto_nome"])
+    projeto["supabase_synced"] = supabase_ok
+    if supabase_ok:
+        print(f"[projetos] Supabase sync OK para uuid={projeto_uuid}", flush=True)
+    else:
+        print(f"[projetos] WARN: Supabase sync falhou para uuid={projeto_uuid}", file=sys.stderr)
+
+    # Sincronizar mapeamento UUID→INT no BQ (best-effort, fire-and-forget)
+    projeto_id_int = projeto.get("id") if isinstance(projeto.get("id"), int) else None
+    if projeto_id_int is not None:
+        loop = asyncio.get_running_loop()
+        asyncio.create_task(
+            loop.run_in_executor(
+                None,
+                _sync_bq_map_sync,
+                projeto_id_int,
+                projeto_uuid,
+                _slugify(projeto["projeto_nome"]),
+                projeto["projeto_nome"],
+            )
+        )
 
     # D-05: Sincronizar com Multica (best-effort)
     nicho = projeto.get("nicho") or (projeto.get("metadata") or {}).get("nicho", "")
@@ -306,4 +445,44 @@ async def get_audit(projeto_id: int):
         "started_at": r["started_at"],
         "completed_at": r["completed_at"],
         "data": r["progress_data"],
+    }
+
+
+@router.get("/{projeto_id}/competitor-audit")
+async def get_competitor_audit(projeto_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        projeto = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)
+        if not projeto:
+            raise HTTPException(404, "Projeto não encontrado")
+        row = await conn.fetchrow(
+            """SELECT slug, keyword_principal, generated_at, competitor_count,
+                      benchmark_word_count, required_sections, schema_missing,
+                      geo_pages_benchmark, backlink_benchmark, trust_gaps, summary,
+                      competitors_json, yaml_path, updated_at
+               FROM competitor_audits
+               WHERE projeto_id = $1""",
+            projeto_id,
+        )
+    if not row:
+        return {"status": "not_found"}
+    r = dict(row)
+    return {
+        "status": "completed",
+        "slug": r["slug"],
+        "keyword_principal": r["keyword_principal"],
+        "generated_at": r["generated_at"],
+        "competitor_count": r["competitor_count"],
+        "market_gaps": {
+            "benchmark_word_count": r["benchmark_word_count"],
+            "required_sections": r["required_sections"] or [],
+            "schema_missing": r["schema_missing"] or [],
+            "geo_pages_benchmark": r["geo_pages_benchmark"],
+            "backlink_benchmark": r["backlink_benchmark"],
+            "trust_gaps": r["trust_gaps"] or [],
+            "summary": r["summary"],
+        },
+        "competitors": r["competitors_json"] or [],
+        "yaml_path": r["yaml_path"],
+        "updated_at": r["updated_at"],
     }
