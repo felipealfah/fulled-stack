@@ -170,7 +170,7 @@ async def list_projetos(
 
 
 @router.get("/{projeto_id}")
-async def get_projeto(projeto_id: int):
+async def get_projeto(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -258,7 +258,7 @@ async def create_projeto(body: ProjetoCreate):
 
 
 @router.patch("/{projeto_id}")
-async def update_projeto(projeto_id: int, body: ProjetoUpdate):
+async def update_projeto(projeto_id: str, body: ProjetoUpdate):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -298,16 +298,20 @@ async def update_projeto(projeto_id: int, body: ProjetoUpdate):
         )
 
         # D-03: Disparar rank_intel quando projeto vai para 'publicado'
-        # Insere na fila agent_executions com projeto_id (nao pesquisa_id)
+        # Insere na fila agent_executions com projeto_id (INTEGER legado via id_int_legado)
         novo_status = fields.get("status")
         if novo_status == "publicado" and status_anterior != "publicado":
+            # Buscar id_int_legado para agent_executions (que ainda tem projeto_id INTEGER)
+            id_int = await conn.fetchval(
+                "SELECT id_int_legado FROM projetos WHERE id = $1", projeto_id
+            )
             await conn.execute(
                 """INSERT INTO agent_executions
                    (projeto_id, analysis_version, agent_name, status, started_at)
                    VALUES ($1, 1, 'rank_intel', 'pending', NOW())""",
-                projeto_id,
+                id_int,
             )
-            print(f"[projetos] rank_intel enfileirado para projeto_id={projeto_id}", flush=True)
+            print(f"[projetos] rank_intel enfileirado para projeto_id={projeto_id} (id_int={id_int})", flush=True)
 
     updated_dict = dict(updated)
 
@@ -328,7 +332,7 @@ async def update_projeto(projeto_id: int, body: ProjetoUpdate):
 
 
 @router.delete("/{projeto_id}")
-async def delete_projeto(projeto_id: int):
+async def delete_projeto(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -349,7 +353,7 @@ async def delete_projeto(projeto_id: int):
 
 
 @router.post("/{projeto_id}/sync-multica")
-async def sync_multica(projeto_id: int, body: SyncMulticaBody = SyncMulticaBody()):
+async def sync_multica(projeto_id: str, body: SyncMulticaBody = SyncMulticaBody()):
     """Backfill: vincula projeto existente ao Multica ou força re-sync."""
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -406,7 +410,7 @@ async def sync_multica(projeto_id: int, body: SyncMulticaBody = SyncMulticaBody(
 
 
 @router.get("/{projeto_id}/pipeline")
-async def get_pipeline(projeto_id: int):
+async def get_pipeline(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         projeto = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)
@@ -424,7 +428,7 @@ async def get_pipeline(projeto_id: int):
 
 
 @router.get("/{projeto_id}/audit")
-async def get_audit(projeto_id: int):
+async def get_audit(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         projeto = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)
@@ -450,7 +454,7 @@ async def get_audit(projeto_id: int):
 
 
 @router.get("/{projeto_id}/competitor-audit")
-async def get_competitor_audit(projeto_id: int):
+async def get_competitor_audit(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         projeto = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)

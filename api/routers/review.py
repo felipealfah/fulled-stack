@@ -155,7 +155,7 @@ async def auto_advance_pesquisa(pesquisa_id: str):
 
 
 class ApproveGate2Request(BaseModel):
-    projeto_id: int | None = None       # vincular a projeto existente
+    projeto_id: str | None = None       # UUID — vincular a projeto existente
     criar_projeto: bool = False          # criar novo projeto a partir desta pesquisa
 
 
@@ -231,15 +231,13 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
                     p.geo_target_id,
                     p.created_at       AS pesquisado_em,
                     p.projeto_nome,
-                    proj.metadata->>'dominio' AS projeto_url
+                    NULL::text         AS projeto_url
                 FROM kw_staging ks
                 JOIN pesquisas p ON p.id = ks.pesquisa_id
-                LEFT JOIN projetos proj ON proj.id = $2
                 WHERE ks.pesquisa_id = $1
                   AND UPPER(COALESCE(ks.kw_type, '')) != 'DESCARTA'
                 """,
                 pesquisa_id,
-                projeto_id,
             )
 
         promovido_em = datetime.now(timezone.utc).isoformat()
