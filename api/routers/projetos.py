@@ -222,10 +222,11 @@ async def create_projeto(body: ProjetoCreate):
         print(f"[projetos] WARN: Supabase sync falhou para uuid={projeto_uuid}", file=sys.stderr)
 
     # Sincronizar mapeamento UUID→INT no BQ (best-effort, fire-and-forget)
+    # run_in_executor retorna Future (não coroutine) — usar ensure_future para agendar
     projeto_id_int = projeto.get("id") if isinstance(projeto.get("id"), int) else None
     if projeto_id_int is not None:
         loop = asyncio.get_running_loop()
-        asyncio.create_task(
+        asyncio.ensure_future(
             loop.run_in_executor(
                 None,
                 _sync_bq_map_sync,
