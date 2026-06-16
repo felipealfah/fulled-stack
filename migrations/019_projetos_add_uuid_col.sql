@@ -10,10 +10,26 @@ ALTER TABLE projetos
 
 -- PASSO 2: Backfill mmentulho com UUID canônico do Supabase CRM
 -- (gen_random_uuid() já foi aplicado no ADD COLUMN para os demais rows)
-UPDATE projetos
-SET id_uuid = 'f131ca75-1d73-4e04-a89b-3bb85045a9eb'::uuid
-WHERE id = 8
-  AND (id_uuid IS NULL OR id_uuid != 'f131ca75-1d73-4e04-a89b-3bb85045a9eb'::uuid);
+-- Usa id_int_legado se existir (pós-migration 021), senão id = 8 (pré-021)
+DO $$
+BEGIN
+  -- Pós-021: id renomeada para id_int_legado — usar essa coluna
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'projetos' AND column_name = 'id_int_legado'
+  ) THEN
+    UPDATE projetos
+    SET id_uuid = 'f131ca75-1d73-4e04-a89b-3bb85045a9eb'::uuid
+    WHERE id_int_legado = 8
+      AND (id_uuid IS NULL OR id_uuid != 'f131ca75-1d73-4e04-a89b-3bb85045a9eb'::uuid);
+  ELSE
+    -- Pré-021: id ainda é INTEGER
+    UPDATE projetos
+    SET id_uuid = 'f131ca75-1d73-4e04-a89b-3bb85045a9eb'::uuid
+    WHERE id = 8
+      AND (id_uuid IS NULL OR id_uuid != 'f131ca75-1d73-4e04-a89b-3bb85045a9eb'::uuid);
+  END IF;
+END $$;
 
 -- PASSO 3: Garantir NOT NULL e unicidade
 -- Primeiro verificar se todos os rows têm id_uuid antes de aplicar NOT NULL

@@ -181,7 +181,7 @@ async def get_projeto(projeto_id: str):
 
         pesquisas = await conn.fetch(
             """SELECT id, projeto_nome, nicho, cidade, status, papel, servico_slug, created_at
-               FROM pesquisas WHERE projeto_id = $1 ORDER BY papel NULLS LAST, created_at""",
+               FROM pesquisas WHERE projeto_id_uuid = $1 ORDER BY papel NULLS LAST, created_at""",
             projeto_id,
         )
 
@@ -341,9 +341,9 @@ async def delete_projeto(projeto_id: str):
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
 
-        # D-16: nullifica projeto_id nas pesquisas antes de deletar
+        # D-16: nullifica projeto_id_uuid nas pesquisas antes de deletar
         await conn.execute(
-            "UPDATE pesquisas SET projeto_id = NULL WHERE projeto_id = $1",
+            "UPDATE pesquisas SET projeto_id_uuid = NULL WHERE projeto_id_uuid = $1",
             projeto_id,
         )
         await conn.execute(
@@ -420,7 +420,7 @@ async def get_pipeline(projeto_id: str):
             """SELECT id, agent_name, status, error_message, progress_data,
                       started_at, triggered_at, completed_at, created_at
                FROM agent_executions
-               WHERE projeto_id = $1
+               WHERE projeto_id_uuid = $1
                ORDER BY created_at ASC""",
             projeto_id,
         )
@@ -437,7 +437,7 @@ async def get_audit(projeto_id: str):
         row = await conn.fetchrow(
             """SELECT id, status, progress_data, started_at, completed_at
                FROM agent_executions
-               WHERE projeto_id = $1 AND agent_name = 'seo_auditor'
+               WHERE projeto_id_uuid = $1 AND agent_name = 'seo_auditor'
                ORDER BY created_at DESC LIMIT 1""",
             projeto_id,
         )
@@ -466,7 +466,7 @@ async def get_competitor_audit(projeto_id: str):
                       geo_pages_benchmark, backlink_benchmark, trust_gaps, summary,
                       competitors_json, yaml_path, updated_at
                FROM competitor_audits
-               WHERE projeto_id = $1""",
+               WHERE projeto_id_uuid = $1""",
             projeto_id,
         )
     if not row:

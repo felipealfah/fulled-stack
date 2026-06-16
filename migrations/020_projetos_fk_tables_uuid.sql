@@ -28,55 +28,88 @@ ALTER TABLE rank_intel_overrides
 
 -- PASSO 2: Backfill — propagar UUID a partir do JOIN com projetos
 -- UPDATE idempotente: só altera rows onde projeto_id_uuid ainda está errado/NULL
+-- Pós-migration 021: projetos.id é UUID, projetos.id_int_legado é INTEGER
+-- O JOIN usa id_int_legado para compatibilidade com FK-tables que ainda têm projeto_id INTEGER.
+-- Se id_int_legado não existir (estado pré-021), usa id (que seria INTEGER nesse estado).
+DO $$
+BEGIN
+  -- Pós-021: projetos.id é UUID, usar id_int_legado no JOIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'projetos' AND column_name = 'id_int_legado'
+  ) THEN
+    UPDATE pesquisas t SET projeto_id_uuid = p.id
+    FROM projetos p
+    WHERE t.projeto_id = p.id_int_legado
+      AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id);
 
-UPDATE pesquisas t
-SET projeto_id_uuid = p.id_uuid
-FROM projetos p
-WHERE t.projeto_id = p.id
-  AND t.projeto_id IS NOT NULL
-  AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+    UPDATE agent_executions t SET projeto_id_uuid = p.id
+    FROM projetos p
+    WHERE t.projeto_id = p.id_int_legado
+      AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id);
 
-UPDATE agent_executions t
-SET projeto_id_uuid = p.id_uuid
-FROM projetos p
-WHERE t.projeto_id = p.id
-  AND t.projeto_id IS NOT NULL
-  AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+    UPDATE competitor_audits t SET projeto_id_uuid = p.id
+    FROM projetos p
+    WHERE t.projeto_id = p.id_int_legado
+      AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id);
 
-UPDATE competitor_audits t
-SET projeto_id_uuid = p.id_uuid
-FROM projetos p
-WHERE t.projeto_id = p.id
-  AND t.projeto_id IS NOT NULL
-  AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+    UPDATE content_pages t SET projeto_id_uuid = p.id
+    FROM projetos p
+    WHERE t.projeto_id = p.id_int_legado
+      AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id);
 
-UPDATE content_pages t
-SET projeto_id_uuid = p.id_uuid
-FROM projetos p
-WHERE t.projeto_id = p.id
-  AND t.projeto_id IS NOT NULL
-  AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+    UPDATE projeto_geo_targets t SET projeto_id_uuid = p.id
+    FROM projetos p
+    WHERE t.projeto_id = p.id_int_legado
+      AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id);
 
-UPDATE projeto_geo_targets t
-SET projeto_id_uuid = p.id_uuid
-FROM projetos p
-WHERE t.projeto_id = p.id
-  AND t.projeto_id IS NOT NULL
-  AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+    UPDATE projeto_seo_plan t SET projeto_id_uuid = p.id
+    FROM projetos p
+    WHERE t.projeto_id = p.id_int_legado
+      AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id);
 
-UPDATE projeto_seo_plan t
-SET projeto_id_uuid = p.id_uuid
-FROM projetos p
-WHERE t.projeto_id = p.id
-  AND t.projeto_id IS NOT NULL
-  AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+    UPDATE rank_intel_overrides t SET projeto_id_uuid = p.id
+    FROM projetos p
+    WHERE t.projeto_id = p.id_int_legado
+      AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id);
+  ELSE
+    -- Pré-021: projetos.id é INTEGER, usar id_uuid
+    UPDATE pesquisas t SET projeto_id_uuid = p.id_uuid
+    FROM projetos p WHERE t.projeto_id = p.id AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
 
-UPDATE rank_intel_overrides t
-SET projeto_id_uuid = p.id_uuid
-FROM projetos p
-WHERE t.projeto_id = p.id
-  AND t.projeto_id IS NOT NULL
-  AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+    UPDATE agent_executions t SET projeto_id_uuid = p.id_uuid
+    FROM projetos p WHERE t.projeto_id = p.id AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+
+    UPDATE competitor_audits t SET projeto_id_uuid = p.id_uuid
+    FROM projetos p WHERE t.projeto_id = p.id AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+
+    UPDATE content_pages t SET projeto_id_uuid = p.id_uuid
+    FROM projetos p WHERE t.projeto_id = p.id AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+
+    UPDATE projeto_geo_targets t SET projeto_id_uuid = p.id_uuid
+    FROM projetos p WHERE t.projeto_id = p.id AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+
+    UPDATE projeto_seo_plan t SET projeto_id_uuid = p.id_uuid
+    FROM projetos p WHERE t.projeto_id = p.id AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+
+    UPDATE rank_intel_overrides t SET projeto_id_uuid = p.id_uuid
+    FROM projetos p WHERE t.projeto_id = p.id AND t.projeto_id IS NOT NULL
+      AND (t.projeto_id_uuid IS NULL OR t.projeto_id_uuid IS DISTINCT FROM p.id_uuid);
+  END IF;
+END $$;
 
 -- PASSO 3: Índices nas FK-tables para queries futuras por UUID
 CREATE INDEX IF NOT EXISTS idx_pesquisas_projeto_id_uuid          ON pesquisas(projeto_id_uuid);
