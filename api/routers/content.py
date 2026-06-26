@@ -3,10 +3,10 @@
 7 endpoints:
   GET    /projetos/{projeto_id}/content                                — lista páginas de conteúdo
   POST   /projetos/{projeto_id}/content                                — upsert (cria ou atualiza sem sobrescrever approved_at)
-  PATCH  /projetos/{projeto_id}/content/{page_slug}/approve            — aprova página (Board): comenta na issue se há flags; aprovado final se tudo ok
+  PATCH  /projetos/{projeto_id}/content/{page_slug}/approve            — aprova página (Board): retorna flagged_sections se há pendências; aprovado final se tudo ok
   PATCH  /projetos/{projeto_id}/content/{page_slug}/status             — atualiza status manualmente (Board override)
   PATCH  /projetos/{projeto_id}/content/{page_slug}/section            — atualiza uma seção do review_report (jsonb_set)
-  POST   /projetos/{projeto_id}/content/{page_slug}/close-review       — reviewer fecha issue (comenta "Não possuem ajustes" + status done)
+  POST   /projetos/{projeto_id}/content/{page_slug}/close-review       — sinaliza revisão concluída: atualiza status para 'revisado', Board aprova via /approve
   DELETE /projetos/{projeto_id}/content/{page_slug}                    — remove página
 
 Segurança (T-21-03): Parâmetros posicionais $1, $2 em todos os handlers — nunca f-string com valores de usuário.
@@ -14,15 +14,10 @@ Idempotência (T-21-04): /approve valida status='revisado' antes de UPDATE.
 JSONB (T-21-05): Codec _init_conn em db.py deserializa review_report JSONB como dict Python automaticamente.
 """
 
-import os
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-import multica
 from db import get_pool
-
-CONTENT_WRITER_AGENT_NAME = os.getenv("CONTENT_WRITER_AGENT_NAME", "seo_content_writer")
 
 router = APIRouter(prefix="/projetos", tags=["content"])
 
@@ -32,10 +27,9 @@ VALID_STATUSES = {'gerado', 'revisado', 'aprovado', 'revisar'}
 
 class ContentPageUpsert(BaseModel):
     page_slug: str
-    page_type: str  # home | service | service_region
+    page_type: str  # home | service | service_region | localidade (v2)
     status: str     # gerado | revisado | aprovado | revisar
     review_report: dict | None = None
-    multica_issue_id: str | None = None  # ID da issue do reviewer para comentar no approve
 
 
 class ContentPageStatusUpdate(BaseModel):
@@ -83,21 +77,19 @@ async def upsert_content_page(projeto_id: int, body: ContentPageUpsert):
             raise HTTPException(404, "Projeto não encontrado")
         row = await conn.fetchrow(
             """INSERT INTO content_pages
-                 (projeto_id, page_slug, page_type, status, review_report, multica_issue_id, reviewed_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+                 (projeto_id, page_slug, page_type, status, review_report, reviewed_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, now(), now())
                ON CONFLICT (projeto_id, page_slug) DO UPDATE
-                 SET status           = EXCLUDED.status,
-                     review_report    = EXCLUDED.review_report,
-                     multica_issue_id = COALESCE(EXCLUDED.multica_issue_id, content_pages.multica_issue_id),
-                     reviewed_at      = now(),
-                     updated_at       = now()
+                 SET status        = EXCLUDED.status,
+                     review_report = EXCLUDED.review_report,
+                     reviewed_at   = now(),
+                     updated_at    = now()
                RETURNING *""",
             projeto_id,
             body.page_slug,
             body.page_type,
             body.status,
             body.review_report,
-            body.multica_issue_id,
         )
         return dict(row)
 
@@ -111,7 +103,7 @@ async def approve_content_page(projeto_id: int, page_slug: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, status, review_report, multica_issue_id FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
+            "SELECT id, status, review_report FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             projeto_id,
             page_slug,
         )
@@ -127,26 +119,8 @@ async def approve_content_page(projeto_id: int, page_slug: str):
             if sec.get("status") in ("ajustar", "flag", "refazer")
         }
 
-        if flagged and row["multica_issue_id"]:
-            # Há seções com problemas → comentar na issue do reviewer para acionar o writer
-            lines = [f"**{CONTENT_WRITER_AGENT_NAME}** correções necessárias em `{page_slug}`:\n"]
-            for name, sec in flagged.items():
-                issues_txt = "; ".join(sec.get("issues") or []) or "—"
-                lines.append(f"- **{name}** ({sec['status']}): {issues_txt}")
-            comment_body = "\n".join(lines)
-            await multica.add_comment(row["multica_issue_id"], comment_body)
-
-            updated = await conn.fetchrow(
-                """UPDATE content_pages
-                   SET status = 'gerado', updated_at = now()
-                   WHERE projeto_id = $1 AND page_slug = $2
-                   RETURNING *""",
-                projeto_id,
-                page_slug,
-            )
-            return {"triggered": True, **dict(updated)}
-
-        # Sem flags pendentes → aprovação final
+        # Board aprova em qualquer caso — flags são informacionais.
+        # triggered=True indica que havia pendências no momento da aprovação (fica registrado).
         updated = await conn.fetchrow(
             """UPDATE content_pages
                SET status = 'aprovado', approved_at = now(), updated_at = now()
@@ -155,7 +129,11 @@ async def approve_content_page(projeto_id: int, page_slug: str):
             projeto_id,
             page_slug,
         )
-        return {"triggered": False, **dict(updated)}
+        return {
+            "triggered": bool(flagged),
+            "flagged_sections": list(flagged.keys()),
+            **dict(updated),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -210,31 +188,26 @@ async def delete_content_page(projeto_id: int, page_slug: str):
 
 @router.post("/{projeto_id}/content/{page_slug}/close-review")
 async def close_review(projeto_id: int, page_slug: str):
-    """Chamado pelo AGENT-010 quando todas as seções estão ok.
-    Comenta na issue do Multica e muda status para done.
-    Mantém status da página como 'revisado' — Board faz aprovação final."""
+    """Sinaliza revisão concluída (todas as seções ok). Atualiza status para 'revisado'.
+    Board faz aprovação final via /approve."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, multica_issue_id FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
+            "SELECT id FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             projeto_id,
             page_slug,
         )
         if not row:
             raise HTTPException(404, "Página não encontrada")
-
-        issue_id = row["multica_issue_id"]
-        commented = False
-        closed = False
-
-        if issue_id:
-            commented = await multica.add_comment(
-                issue_id,
-                f"✅ Revisão concluída para `{page_slug}` — não possuem ajustes. Todas as seções estão ok.\n\nBoard pode aprovar no dashboard.",
-            )
-            closed = await multica.close_issue(issue_id, f"seo_content_reviewer: {page_slug}")
-
-        return {"page_slug": page_slug, "issue_id": issue_id, "commented": commented, "closed": closed}
+        updated = await conn.fetchrow(
+            """UPDATE content_pages
+               SET status = 'revisado', reviewed_at = now(), updated_at = now()
+               WHERE projeto_id = $1 AND page_slug = $2
+               RETURNING *""",
+            projeto_id,
+            page_slug,
+        )
+        return dict(updated)
 
 
 # ---------------------------------------------------------------------------
