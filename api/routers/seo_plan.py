@@ -9,6 +9,8 @@
 Segurança (T-14-01): PATCH pages valida que page pertence ao projeto via JOIN.
 Idempotência (T-14-02): /ready faz SELECT antes de INSERT em agent_executions.
 SQL injection (T-14-03): f-string apenas para nomes de colunas (controlados pelo BaseModel).
+
+Phase 05: projeto_id no path é UUID (str). Queries em tabelas legadas usam id_int_legado.
 """
 
 from typing import Literal
@@ -21,29 +23,36 @@ from db import get_pool
 router = APIRouter(prefix="/projetos", tags=["seo-plan"])
 
 
+async def _resolve_projeto(conn, projeto_id: str) -> dict:
+    """Resolve UUID para linha do projeto com id_int_legado."""
+    proj = await conn.fetchrow(
+        "SELECT id, id_int_legado FROM projetos WHERE id = $1::uuid",
+        projeto_id,
+    )
+    if not proj:
+        raise HTTPException(404, "Projeto não encontrado")
+    return dict(proj)
+
+
 # ---------------------------------------------------------------------------
 # GET /{projeto_id}/seo-plan
 # ---------------------------------------------------------------------------
 
 @router.get("/{projeto_id}/seo-plan")
-async def get_seo_plan(projeto_id: int):
+async def get_seo_plan(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Verificar projeto existe
-        proj = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)
-        if not proj:
-            raise HTTPException(404, "Projeto não encontrado")
+        proj = await _resolve_projeto(conn, projeto_id)
+        pid_int = proj["id_int_legado"]
 
-        # Buscar plano
         plan_row = await conn.fetchrow(
-            "SELECT * FROM projeto_seo_plan WHERE projeto_id = $1", projeto_id
+            "SELECT * FROM projeto_seo_plan WHERE projeto_id = $1", pid_int
         )
         if not plan_row:
             raise HTTPException(404, "Plano SEO não encontrado")
 
         plan = dict(plan_row)
 
-        # Buscar pages com JOIN pesquisas + kw_staging
         pages_rows = await conn.fetch(
             """
             SELECT
@@ -76,7 +85,6 @@ async def get_seo_plan(projeto_id: int):
             plan["id"],
         )
 
-        # Para cada page, buscar keywords aprovadas para o dropdown
         pages = []
         for page_row in pages_rows:
             page = dict(page_row)
@@ -92,7 +100,6 @@ async def get_seo_plan(projeto_id: int):
             page["keywords"] = [dict(k) for k in kws]
             pages.append(page)
 
-        # Pesquisas gate_2_approved que não têm page no plano
         sem_plano = await conn.fetch(
             """
             SELECT id::text FROM pesquisas
@@ -103,17 +110,16 @@ async def get_seo_plan(projeto_id: int):
                 WHERE plan_id = $2 AND pesquisa_id IS NOT NULL
               )
             """,
-            projeto_id,
+            pid_int,
             plan["id"],
         )
 
-        # Verificar se competitive_intel está pendente/em execução
         exec_row = await conn.fetchrow(
             """SELECT id FROM agent_executions
                WHERE projeto_id = $1
                  AND agent_name = 'competitive_intel'
                  AND status IN ('pending', 'in_progress')""",
-            projeto_id,
+            pid_int,
         )
 
         plan["pages"] = pages
@@ -127,24 +133,21 @@ async def get_seo_plan(projeto_id: int):
 # ---------------------------------------------------------------------------
 
 @router.post("/{projeto_id}/seo-plan/generate")
-async def generate_seo_plan(projeto_id: int):
+async def generate_seo_plan(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        proj = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)
-        if not proj:
-            raise HTTPException(404, "Projeto não encontrado")
+        proj = await _resolve_projeto(conn, projeto_id)
+        pid_int = proj["id_int_legado"]
 
-        # Buscar pesquisas gate_2_approved
         pesquisas = await conn.fetch(
             """SELECT id::text, papel FROM pesquisas
-               WHERE projeto_id = $1 AND status = 'gate_2_approved'
+               WHERE projeto_id = $1 AND status IN ('gate_2_approved', 'aprovado')
                ORDER BY created_at""",
-            projeto_id,
+            pid_int,
         )
 
-        # Criar ou recuperar plano existente
         plan_row = await conn.fetchrow(
-            "SELECT id FROM projeto_seo_plan WHERE projeto_id = $1", projeto_id
+            "SELECT id FROM projeto_seo_plan WHERE projeto_id = $1", pid_int
         )
         if plan_row:
             plan_id = plan_row["id"]
@@ -155,10 +158,9 @@ async def generate_seo_plan(projeto_id: int):
             plan_id = await conn.fetchval(
                 """INSERT INTO projeto_seo_plan (projeto_id, status)
                    VALUES ($1, 'rascunho') RETURNING id""",
-                projeto_id,
+                pid_int,
             )
 
-        # Inserir pages para pesquisas novas (ON CONFLICT DO NOTHING preserva kw_principal_id existente)
         for p in pesquisas:
             await conn.execute(
                 """INSERT INTO projeto_seo_plan_pages (plan_id, pesquisa_id, papel)
@@ -169,7 +171,6 @@ async def generate_seo_plan(projeto_id: int):
                 p["papel"],
             )
 
-    # Retornar plano completo via GET handler
     return await get_seo_plan(projeto_id)
 
 
@@ -183,21 +184,23 @@ class SeoPlanPageUpdate(BaseModel):
 
 
 @router.patch("/{projeto_id}/seo-plan/pages/{page_id}")
-async def update_seo_plan_page(projeto_id: int, page_id: int, body: SeoPlanPageUpdate):
+async def update_seo_plan_page(projeto_id: str, page_id: int, body: SeoPlanPageUpdate):
     pool = await get_pool()
     async with pool.acquire() as conn:
+        proj = await _resolve_projeto(conn, projeto_id)
+        pid_int = proj["id_int_legado"]
+
         # T-14-01: Validar que page pertence ao projeto (evitar PATCH cross-projeto)
         row = await conn.fetchrow(
             """SELECT p.id FROM projeto_seo_plan_pages p
                JOIN projeto_seo_plan sp ON sp.id = p.plan_id
                WHERE p.id = $1 AND sp.projeto_id = $2""",
             page_id,
-            projeto_id,
+            pid_int,
         )
         if not row:
             raise HTTPException(404, "Página do plano não encontrada")
 
-        # exclude_unset=True para permitir null (deseleção de kw_principal)
         fields = body.model_dump(exclude_unset=True)
         if not fields:
             raise HTTPException(400, "Nenhum campo para atualizar")
@@ -215,7 +218,6 @@ async def update_seo_plan_page(projeto_id: int, page_id: int, body: SeoPlanPageU
             *values,
         )
 
-        # Atualizar updated_at do plano pai
         await conn.execute(
             """UPDATE projeto_seo_plan SET updated_at = NOW()
                WHERE id = (SELECT plan_id FROM projeto_seo_plan_pages WHERE id = $1)""",
@@ -230,18 +232,21 @@ async def update_seo_plan_page(projeto_id: int, page_id: int, body: SeoPlanPageU
 # ---------------------------------------------------------------------------
 
 @router.patch("/{projeto_id}/seo-plan/ready")
-async def mark_seo_plan_ready(projeto_id: int):
+async def mark_seo_plan_ready(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
+        proj = await _resolve_projeto(conn, projeto_id)
+        pid_int = proj["id_int_legado"]
+
         plan_row = await conn.fetchrow(
-            "SELECT id FROM projeto_seo_plan WHERE projeto_id = $1", projeto_id
+            "SELECT id FROM projeto_seo_plan WHERE projeto_id = $1", pid_int
         )
         if not plan_row:
             raise HTTPException(404, "Plano SEO não encontrado")
 
         await conn.execute(
             "UPDATE projeto_seo_plan SET status = 'pronto', updated_at = NOW() WHERE projeto_id = $1",
-            projeto_id,
+            pid_int,
         )
 
         # T-14-02: Idempotente — verificar antes de inserir
@@ -250,21 +255,19 @@ async def mark_seo_plan_ready(projeto_id: int):
                WHERE projeto_id = $1
                  AND agent_name = 'competitive_intel'
                  AND status IN ('pending', 'in_progress')""",
-            projeto_id,
+            pid_int,
         )
 
         exec_id = None
         if not existing:
-            # pesquisa_id NOT NULL na tabela — usar primeira pesquisa gate_2_approved do projeto como âncora
             pesquisa_row = await conn.fetchrow(
                 """SELECT id FROM pesquisas
                    WHERE projeto_id = $1 AND status = 'gate_2_approved'
                    ORDER BY created_at LIMIT 1""",
-                projeto_id,
+                pid_int,
             )
             if not pesquisa_row:
-                # Sem pesquisas aprovadas — retornar sem enfileirar (plano marcado como pronto mesmo assim)
-                print(f"[seo_plan] sem pesquisas gate_2_approved para projeto_id={projeto_id}, competitive_intel não enfileirado", flush=True)
+                print(f"[seo_plan] sem pesquisas gate_2_approved para projeto_id={pid_int}, competitive_intel não enfileirado", flush=True)
                 return {"ok": True, "agent_executions_id": None}
 
             exec_id = await conn.fetchval(
@@ -272,13 +275,13 @@ async def mark_seo_plan_ready(projeto_id: int):
                    (projeto_id, pesquisa_id, analysis_version, agent_name, status, started_at)
                    VALUES ($1, $2, 1, 'competitive_intel', 'pending', NOW())
                    RETURNING id""",
-                projeto_id,
+                pid_int,
                 pesquisa_row["id"],
             )
-            print(f"[seo_plan] competitive_intel enfileirado para projeto_id={projeto_id}", flush=True)
+            print(f"[seo_plan] competitive_intel enfileirado para projeto_id={pid_int}", flush=True)
         else:
             exec_id = existing["id"]
-            print(f"[seo_plan] competitive_intel já em fila para projeto_id={projeto_id}, ignorando", flush=True)
+            print(f"[seo_plan] competitive_intel já em fila para projeto_id={pid_int}, ignorando", flush=True)
 
     return {"ok": True, "agent_executions_id": exec_id}
 
@@ -297,23 +300,25 @@ class SeoPlanPageIntelUpdate(BaseModel):
 
 
 @router.patch("/{projeto_id}/seo-plan/pages/{page_id}/intel")
-async def update_seo_plan_page_intel(projeto_id: int, page_id: int, body: SeoPlanPageIntelUpdate):
+async def update_seo_plan_page_intel(projeto_id: str, page_id: int, body: SeoPlanPageIntelUpdate):
     if body.difficulty_label not in ("baixo", "médio", "alto"):
         raise HTTPException(400, "difficulty_label deve ser 'baixo', 'médio' ou 'alto'")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        proj = await _resolve_projeto(conn, projeto_id)
+        pid_int = proj["id_int_legado"]
+
         # T-15-01: Validar que page pertence ao projeto (evitar PATCH cross-projeto)
         row = await conn.fetchrow(
             """SELECT p.id FROM projeto_seo_plan_pages p
                JOIN projeto_seo_plan sp ON sp.id = p.plan_id
                WHERE p.id = $1 AND sp.projeto_id = $2""",
-            page_id, projeto_id,
+            page_id, pid_int,
         )
         if not row:
             raise HTTPException(404, "Página do plano não encontrada")
 
-        # Atualiza snapshot na tabela principal
         await conn.execute(
             """UPDATE projeto_seo_plan_pages
                SET competitive_score  = $2,
@@ -327,8 +332,6 @@ async def update_seo_plan_page_intel(projeto_id: int, page_id: int, body: SeoPla
             body.top_competitor_url,
         )
 
-        # Insere row no histórico
-        # JSONB codec está registrado via get_pool()/_init_conn — passar dict diretamente funciona
         await conn.execute(
             """INSERT INTO projeto_seo_plan_pages_intel
                (page_id, competitive_score, difficulty_label, top_competitor_url, intel_data)

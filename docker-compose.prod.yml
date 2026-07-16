@@ -1,0 +1,148 @@
+# Full AIOS STACK — Produção (VPS via Portainer)
+# Diferenças do docker-compose.yml (dev local):
+#   - SEM bind mount do Mac (Full_AIOS_Data) → volume nomeado `fulled_data`
+#   - AUTH_ENABLED default TRUE (dashboard exposto exige login)
+#   - Serviço `backup`: pg_dump diário com retenção de 14 dias no volume `pgbackups`
+#   - Portas configuráveis por env (FRONTEND_PORT, API_PORT, POSTGRES_PORT)
+#
+# Portainer: Stacks → Add stack → Repository
+#   Repository URL: https://github.com/<user>/fulled-stack
+#   Compose path:   docker-compose.prod.yml
+#   Env vars:       definir no painel (ver DEPLOY_VPS.md §4)
+#
+# ⚠️ Postgres fica exposto (scripts do MacBook conectam direto via DATABASE_URL).
+#    Restrinja a porta 5432 no firewall da VPS ao seu IP, ou use Tailscale.
+
+name: fulled-stack
+
+services:
+
+  postgres:
+    image: postgres:17
+    container_name: fulled-postgres
+    environment:
+      POSTGRES_DB: fulled
+      POSTGRES_USER: fulled
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fulled -d fulled"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - fulled-stack
+
+  # Init container: aplica schema base + migrations em ordem e encerra (idempotente).
+  migrator:
+    image: postgres:17
+    container_name: fulled-migrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./api/schema.sql:/sql/schema.sql:ro
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo "[migrator] aplicando schema base..."
+        psql -h postgres -U fulled -d fulled -v ON_ERROR_STOP=1 -f /sql/schema.sql
+        for f in /migrations/*.sql; do
+          echo "[migrator] aplicando $$f..."
+          psql -h postgres -U fulled -d fulled -v ON_ERROR_STOP=1 -f "$$f"
+        done
+        echo "[migrator] todas as migrations aplicadas com sucesso."
+    restart: "no"
+    networks:
+      - fulled-stack
+
+  fastapi:
+    build:
+      context: ./api
+    container_name: fulled-fastapi
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgres://fulled:${POSTGRES_PASSWORD}@postgres:5432/fulled
+      # Produção: auth LIGADA por default
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      DASHBOARD_USER: ${DASHBOARD_USER:?defina DASHBOARD_USER}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?defina DASHBOARD_PASSWORD}
+      AUTH_SECRET: ${AUTH_SECRET:?defina AUTH_SECRET}
+      STACK_API_KEY: ${STACK_API_KEY:?defina STACK_API_KEY}
+      GCP_SC_KEY: ${GCP_SC_KEY:-}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      DATA_DIR: /data/leadgen
+    volumes:
+      # Na VPS não existe o path do Mac — volume nomeado (cache SerpAPI, parquets)
+      - fulled_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - fulled-stack
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: fulled-frontend
+    ports:
+      - "${FRONTEND_PORT:-3001}:80"
+    depends_on:
+      - fastapi
+    restart: unless-stopped
+    networks:
+      - fulled-stack
+
+  # Backup diário do Postgres — dump comprimido, retenção de 14 dias.
+  backup:
+    image: postgres:17
+    container_name: fulled-backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgbackups:/backups
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "[backup] serviço iniciado — dump diário às 03:00, retenção 14 dias"
+        while true; do
+          sleep_seconds=$$(( ( 24*3600 + 3*3600 - $$(date +%s) % 86400 ) % 86400 ))
+          echo "[backup] próximo dump em $${sleep_seconds}s"
+          sleep $$sleep_seconds
+          ts=$$(date +%Y%m%d_%H%M%S)
+          echo "[backup] gerando /backups/fulled_$${ts}.dump"
+          pg_dump -h postgres -U fulled -d fulled -Fc -f "/backups/fulled_$${ts}.dump" \
+            && echo "[backup] OK fulled_$${ts}.dump" \
+            || echo "[backup] ERRO no dump $${ts}"
+          find /backups -name 'fulled_*.dump' -mtime +14 -delete 2>/dev/null || true
+        done
+    restart: unless-stopped
+    networks:
+      - fulled-stack
+
+volumes:
+  pgdata:
+  pgbackups:
+  fulled_data:
+
+networks:
+  fulled-stack:
+    driver: bridge

@@ -160,8 +160,8 @@ class ApproveGate2Request(BaseModel):
 
 
 class PesquisaVincularUpdate(BaseModel):
-    projeto_id: int | None = None
-    papel: str | None = None          # 'principal' | 'servico'
+    projeto_id: str | None = None      # UUID do projeto
+    papel: str | None = None           # 'principal' | 'servico'
     servico_slug: str | None = None
 
 
@@ -295,17 +295,37 @@ async def vincular_pesquisa(pesquisa_id: str, body: PesquisaVincularUpdate):
         if not row:
             raise HTTPException(404, "Pesquisa não encontrada")
 
-        fields = {k: v for k, v in body.model_dump().items() if v is not None}
-        if not fields:
+        if not any([body.projeto_id, body.papel, body.servico_slug]):
             raise HTTPException(400, "Nenhum campo para atualizar")
 
-        set_clause = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(fields))
-        values = list(fields.values())
+        # projeto_id chega como UUID — precisa atualizar as duas colunas:
+        # projeto_id_uuid (UUID, lido por projetos.py) e projeto_id (int legado)
+        if body.projeto_id:
+            projeto = await conn.fetchrow(
+                "SELECT id_int_legado FROM projetos WHERE id = $1", body.projeto_id
+            )
+            if not projeto:
+                raise HTTPException(404, "Projeto não encontrado")
+            await conn.execute(
+                """UPDATE pesquisas
+                   SET projeto_id_uuid = $2, projeto_id = $3
+                   WHERE id = $1""",
+                pesquisa_id, body.projeto_id, projeto["id_int_legado"],
+            )
 
-        await conn.execute(
-            f"UPDATE pesquisas SET {set_clause} WHERE id = $1",
-            pesquisa_id, *values,
-        )
+        # papel e servico_slug são atualizações simples de texto
+        if body.papel or body.servico_slug:
+            extra: dict = {}
+            if body.papel:
+                extra["papel"] = body.papel
+            if body.servico_slug:
+                extra["servico_slug"] = body.servico_slug
+            set_clause = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(extra))
+            await conn.execute(
+                f"UPDATE pesquisas SET {set_clause} WHERE id = $1",
+                pesquisa_id, *extra.values(),
+            )
+
     return {"ok": True}
 
 

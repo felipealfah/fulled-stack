@@ -8,12 +8,11 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from db import get_pool
-import multica
-
 router = APIRouter(prefix="/projetos", tags=["projetos"])
 
 _SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 _SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+_SUPABASE_ADMIN_USER_ID = os.environ.get("SUPABASE_ADMIN_USER_ID", "")
 
 
 def _slugify(text: str) -> str:
@@ -59,6 +58,16 @@ async def _sync_supabase(projeto_uuid: str, nome: str) -> bool:
                     file=sys.stderr,
                 )
                 return False
+
+            # Vincular admin como membro do projeto (idempotente via ON CONFLICT DO NOTHING)
+            if _SUPABASE_ADMIN_USER_ID:
+                await client.post(
+                    f"{_SUPABASE_URL}/rest/v1/usuarios_projetos",
+                    headers={**headers, "Prefer": "return=minimal,resolution=ignore-duplicates"},
+                    json={"user_id": _SUPABASE_ADMIN_USER_ID, "projeto_id": projeto_uuid, "role": "admin"},
+                    timeout=10,
+                )
+
             return True
     except Exception as e:
         print(f"[projetos] Supabase sync erro: {e}", file=sys.stderr)
@@ -135,10 +144,6 @@ class ProjetoUpdate(BaseModel):
     receita_mensal: float | None = None
 
 
-class SyncMulticaBody(BaseModel):
-    multica_project_id: str | None = None
-
-
 @router.get("/")
 async def list_projetos(
     tipo: str | None = Query(default=None),
@@ -213,17 +218,12 @@ async def create_projeto(body: ProjetoCreate):
     # Extrair UUID gerado pelo Postgres (Pitfall 3: asyncpg retorna uuid.UUID, não str)
     projeto_uuid = str(projeto.get("id_uuid") or projeto["id"])
 
-    # Sincronizar UUID com Supabase CRM (best-effort)
-    supabase_ok = await _sync_supabase(projeto_uuid, projeto["projeto_nome"])
-    projeto["supabase_synced"] = supabase_ok
-    if supabase_ok:
-        print(f"[projetos] Supabase sync OK para uuid={projeto_uuid}", flush=True)
-    else:
-        print(f"[projetos] WARN: Supabase sync falhou para uuid={projeto_uuid}", file=sys.stderr)
+    # Supabase CRM: sync ocorre apenas quando projeto vai para 'publicado' (não na criação)
 
     # Sincronizar mapeamento UUID→INT no BQ (best-effort, fire-and-forget)
     # run_in_executor retorna Future (não coroutine) — usar ensure_future para agendar
-    projeto_id_int = projeto.get("id") if isinstance(projeto.get("id"), int) else None
+    # Após Phase 05: projeto["id"] é UUID — o inteiro legado está em id_int_legado
+    projeto_id_int = projeto.get("id_int_legado")
     if projeto_id_int is not None:
         loop = asyncio.get_running_loop()
         asyncio.ensure_future(
@@ -237,23 +237,6 @@ async def create_projeto(body: ProjetoCreate):
             )
         )
 
-    # D-05: Sincronizar com Multica (best-effort)
-    nicho = projeto.get("nicho") or (projeto.get("metadata") or {}).get("nicho", "")
-    cidade = projeto.get("cidade") or (projeto.get("metadata") or {}).get("cidade", "")
-    site_url = (projeto.get("metadata") or {}).get("site_url", "—")
-    description = f"{projeto['tipo']} | {nicho} | {cidade} | {site_url}"
-    multica_id = await multica.create_project(projeto["projeto_nome"], description)
-    if multica_id:
-        pool2 = await get_pool()
-        async with pool2.acquire() as conn2:
-            await conn2.execute(
-                "UPDATE projetos SET multica_project_id = $1 WHERE id = $2",
-                multica_id,
-                projeto["id"],
-            )
-        projeto["multica_project_id"] = multica_id
-        print(f"[projetos] multica_project_id={multica_id} salvo para projeto_id={projeto['id']}", flush=True)
-
     return projeto
 
 
@@ -262,12 +245,13 @@ async def update_projeto(projeto_id: str, body: ProjetoUpdate):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, status FROM projetos WHERE id = $1", projeto_id
+            "SELECT id, status, tipo FROM projetos WHERE id = $1", projeto_id
         )
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
 
         status_anterior = row["status"]
+        tipo = row["tipo"]
 
         raw = body.model_dump()
         fields = {}
@@ -313,22 +297,16 @@ async def update_projeto(projeto_id: str, body: ProjetoUpdate):
             )
             print(f"[projetos] rank_intel enfileirado para projeto_id={projeto_id} (id_int={id_int})", flush=True)
 
-    updated_dict = dict(updated)
+        # Sincronizar com Supabase CRM quando projeto vai para 'publicado' (rank_rent only)
+        if novo_status == "publicado" and status_anterior != "publicado" and tipo == "rank_rent":
+            projeto_nome = dict(updated)["projeto_nome"]
+            supabase_ok = await _sync_supabase(projeto_id, projeto_nome)
+            if supabase_ok:
+                print(f"[projetos] Supabase sync OK ao publicar uuid={projeto_id}", flush=True)
+            else:
+                print(f"[projetos] WARN: Supabase sync falhou ao publicar uuid={projeto_id}", file=sys.stderr)
 
-    # D-05: Sincronizar com Multica se projeto já tem vínculo
-    multica_id_salvo = updated_dict.get("multica_project_id")
-    if multica_id_salvo:
-        nicho = updated_dict.get("nicho") or (updated_dict.get("metadata") or {}).get("nicho", "")
-        cidade = updated_dict.get("cidade") or (updated_dict.get("metadata") or {}).get("cidade", "")
-        site_url = (updated_dict.get("metadata") or {}).get("site_url", "—")
-        description = f"{updated_dict['tipo']} | {nicho} | {cidade} | {site_url}"
-        await multica.update_project(
-            str(multica_id_salvo),
-            updated_dict["projeto_nome"],
-            description,
-        )
-
-    return updated_dict
+    return dict(updated)
 
 
 @router.delete("/{projeto_id}")
@@ -350,63 +328,6 @@ async def delete_projeto(projeto_id: str):
             "DELETE FROM projetos WHERE id = $1", projeto_id
         )
     return {"ok": True}
-
-
-@router.post("/{projeto_id}/sync-multica")
-async def sync_multica(projeto_id: str, body: SyncMulticaBody = SyncMulticaBody()):
-    """Backfill: vincula projeto existente ao Multica ou força re-sync."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, projeto_nome, tipo, nicho, cidade, metadata, multica_project_id FROM projetos WHERE id = $1",
-            projeto_id,
-        )
-        if not row:
-            raise HTTPException(404, "Projeto não encontrado")
-
-    projeto = dict(row)
-    nicho = projeto.get("nicho") or (projeto.get("metadata") or {}).get("nicho", "")
-    cidade = projeto.get("cidade") or (projeto.get("metadata") or {}).get("cidade", "")
-    site_url = (projeto.get("metadata") or {}).get("site_url", "—")
-    description = f"{projeto['tipo']} | {nicho} | {cidade} | {site_url}"
-
-    multica_id_existente = str(projeto["multica_project_id"]) if projeto["multica_project_id"] else None
-
-    if body.multica_project_id:
-        # D-07: Vincular a board já existente (ex: MM Entulho)
-        multica_id = body.multica_project_id
-        await multica.update_project(multica_id, projeto["projeto_nome"], description)
-        pool2 = await get_pool()
-        async with pool2.acquire() as conn2:
-            await conn2.execute(
-                "UPDATE projetos SET multica_project_id = $1 WHERE id = $2",
-                multica_id,
-                projeto_id,
-            )
-        print(f"[projetos] sync-multica: projeto_id={projeto_id} vinculado a multica_id={multica_id}", flush=True)
-        return {"ok": True, "action": "linked", "multica_project_id": multica_id}
-
-    elif multica_id_existente:
-        # Já tem vínculo: apenas atualizar dados
-        await multica.update_project(multica_id_existente, projeto["projeto_nome"], description)
-        print(f"[projetos] sync-multica: projeto_id={projeto_id} atualizado no Multica", flush=True)
-        return {"ok": True, "action": "updated", "multica_project_id": multica_id_existente}
-
-    else:
-        # Sem vínculo: criar novo board no Multica
-        novo_id = await multica.create_project(projeto["projeto_nome"], description)
-        if novo_id:
-            pool2 = await get_pool()
-            async with pool2.acquire() as conn2:
-                await conn2.execute(
-                    "UPDATE projetos SET multica_project_id = $1 WHERE id = $2",
-                    novo_id,
-                    projeto_id,
-                )
-            print(f"[projetos] sync-multica: novo multica_project_id={novo_id} para projeto_id={projeto_id}", flush=True)
-            return {"ok": True, "action": "created", "multica_project_id": novo_id}
-        else:
-            return {"ok": False, "action": "failed", "multica_project_id": None, "message": "Multica offline ou erro — ver logs"}
 
 
 @router.get("/{projeto_id}/pipeline")

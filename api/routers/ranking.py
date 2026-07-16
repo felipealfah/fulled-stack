@@ -60,7 +60,7 @@ def _slugify(name: str) -> str:
     return text
 
 
-def _compute_report(bq_client, projeto_id: int, projeto_nome: str) -> dict:
+def _compute_report(bq_client, projeto_id_int: int, projeto_nome: str) -> dict:
     """Calcula relatório de ranking comparando último snapshot vs penúltimo.
 
     Lê de leadgen_gold.ranking_history via BQ (substitui Parquet + DuckDB).
@@ -80,7 +80,7 @@ def _compute_report(bq_client, projeto_id: int, projeto_nome: str) -> dict:
         ORDER BY snapshot_date
     """
     job_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
     ])
     bq_rows = list(bq_client.query(query, job_config=job_config).result())
     if not bq_rows:
@@ -211,7 +211,7 @@ def _compute_report(bq_client, projeto_id: int, projeto_nome: str) -> dict:
         "report_date": curr_date.isoformat(),
         "current_snapshot_date": curr_date.isoformat(),
         "previous_snapshot_date": prev_date.isoformat() if prev_date else None,
-        "projeto_id": projeto_id,
+        "projeto_id": projeto_id_int,
         "projeto_nome": projeto_nome,
         "summary": {
             "total": total,
@@ -231,15 +231,17 @@ def _compute_report(bq_client, projeto_id: int, projeto_nome: str) -> dict:
 
 
 @router.get("/{projeto_id}/ranking")
-async def get_ranking(projeto_id: int):
+async def get_ranking(projeto_id: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT projeto_nome, metadata->>'dominio' AS dominio FROM projetos WHERE id = $1",
+            "SELECT projeto_nome, id_int_legado, metadata->>'dominio' AS dominio FROM projetos WHERE id = $1",
             projeto_id,
         )
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
+
+    projeto_id_int = row["id_int_legado"]
 
     bq = _load_bq_client()
     query = f"""
@@ -249,7 +251,7 @@ async def get_ranking(projeto_id: int):
         ORDER BY status, serp_position NULLS LAST
     """
     job_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
     ])
     try:
         rows = list(bq.query(query, job_config=job_config).result())
@@ -285,7 +287,7 @@ async def get_ranking(projeto_id: int):
 
 
 @router.get("/{projeto_id}/ranking/history")
-async def get_ranking_history(projeto_id: int, keyword: Optional[str] = None):
+async def get_ranking_history(projeto_id: str, keyword: Optional[str] = None):
     """Retorna série histórica de posições por keyword.
 
     Query param opcional: keyword=<texto> — filtra para uma única keyword.
@@ -293,11 +295,13 @@ async def get_ranking_history(projeto_id: int, keyword: Optional[str] = None):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT projeto_nome FROM projetos WHERE id = $1",
+            "SELECT projeto_nome, id_int_legado FROM projetos WHERE id = $1",
             projeto_id,
         )
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
+
+    projeto_id_int = row["id_int_legado"]
 
     bq = _load_bq_client()
     if keyword:
@@ -308,7 +312,7 @@ async def get_ranking_history(projeto_id: int, keyword: Optional[str] = None):
             ORDER BY keyword, snapshot_date
         """
         params = [
-            bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+            bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
             bigquery.ScalarQueryParameter("keyword", "STRING", keyword),
         ]
     else:
@@ -318,7 +322,7 @@ async def get_ranking_history(projeto_id: int, keyword: Optional[str] = None):
             WHERE projeto_id = @projeto_id
             ORDER BY keyword, snapshot_date
         """
-        params = [bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id)]
+        params = [bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int)]
 
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     try:
@@ -354,7 +358,7 @@ async def get_ranking_history(projeto_id: int, keyword: Optional[str] = None):
 
 
 @router.get("/{projeto_id}/ranking/report")
-async def get_ranking_report(projeto_id: int):
+async def get_ranking_report(projeto_id: str):
     """Relatório semanal de ranking: sumário atual + deltas vs snapshot anterior.
 
     Modos:
@@ -365,11 +369,13 @@ async def get_ranking_report(projeto_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT projeto_nome FROM projetos WHERE id = $1",
+            "SELECT projeto_nome, id_int_legado FROM projetos WHERE id = $1",
             projeto_id,
         )
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
+
+    projeto_id_int = row["id_int_legado"]
 
     bq = _load_bq_client()
     check_query = f"""
@@ -378,7 +384,7 @@ async def get_ranking_report(projeto_id: int):
         WHERE projeto_id = @projeto_id
     """
     check_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id),
+        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
     ])
     try:
         n_rows = list(bq.query(check_query, job_config=check_config).result())[0]["n"]
@@ -390,12 +396,12 @@ async def get_ranking_report(projeto_id: int):
             "status": "not_ready",
             "message": "Histórico de ranking ainda não disponível. Execute rank_intel ao menos uma vez.",
         }
-    return _compute_report(bq, projeto_id, row["projeto_nome"])
+    return _compute_report(bq, projeto_id_int, row["projeto_nome"])
 
 
 @router.get("/{projeto_id}/seo-yaml-template")
-async def get_seo_yaml_template(projeto_id: int):
-    """Gera YAML pronto para colar no Multica ao abrir issue do seo_architect.
+async def get_seo_yaml_template(projeto_id: str):
+    """Gera YAML de input para o agente seo_architect.
 
     Serviços: derivados dos nichos das pesquisas aprovadas no Gate 2 vinculadas ao projeto.
     Cidades:  derivadas do metadata do projeto (campo 'cidade').
@@ -465,17 +471,20 @@ async def get_seo_yaml_template(projeto_id: int):
 
 
 @router.post("/{projeto_id}/rank-intel")
-async def trigger_rank_intel(projeto_id: int):
-    """Escreve arquivo trigger em /data/leadgen/.trigger_{id}.
+async def trigger_rank_intel(projeto_id: str):
+    """Escreve arquivo trigger em /data/leadgen/.trigger_{id_int}.
     O sc-sync detecta o arquivo no próximo ciclo (≤60s) e executa o pipeline completo.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)
+        row = await conn.fetchrow(
+            "SELECT id_int_legado FROM projetos WHERE id = $1", projeto_id
+        )
         if not row:
             raise HTTPException(404, "Projeto não encontrado")
 
-    trigger_path = DATA_DIR / f".trigger_{projeto_id}"
+    projeto_id_int = row["id_int_legado"]
+    trigger_path = DATA_DIR / f".trigger_{projeto_id_int}"
     trigger_path.touch()
     print(f"[rank_intel] trigger criado: {trigger_path}", flush=True)
 

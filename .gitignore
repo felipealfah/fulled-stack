@@ -7,3 +7,5 @@ node_modules/
 dist/
 .cache/
 *.log
+graphify-out/
+.rename_test*
