@@ -95,6 +95,7 @@ services:
     restart: unless-stopped
     networks:
       - fulled-stack
+      - proxy_net
 
   frontend:
     build:
@@ -107,6 +108,7 @@ services:
     restart: unless-stopped
     networks:
       - fulled-stack
+      - proxy_net
 
   # Backup diário do Postgres — dump comprimido, retenção de 14 dias.
   backup:
@@ -147,3 +149,5 @@ volumes:
 networks:
   fulled-stack:
     driver: bridge
+  proxy_net:
+    external: true
