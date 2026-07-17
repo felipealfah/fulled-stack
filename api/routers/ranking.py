@@ -7,6 +7,7 @@ Se dados nao existirem no BQ: {"status": "not_ready", "message": "..."}
 Se projeto nao existir: 404
 """
 
+import base64
 import json
 import math
 import os
@@ -34,6 +35,8 @@ def _load_bq_client() -> bigquery.Client:
     """Autentica SA leadgen-sc via GCP_SC_KEY env var."""
     gcp_key_json = os.environ.get("GCP_SC_KEY") or os.environ.get("GCP_GADS_KEY")
     if gcp_key_json:
+        if not gcp_key_json.strip().startswith("{"):
+            gcp_key_json = base64.b64decode(gcp_key_json).decode()
         key_info = json.loads(gcp_key_json)
         credentials = service_account.Credentials.from_service_account_info(
             key_info, scopes=BQ_SCOPES
