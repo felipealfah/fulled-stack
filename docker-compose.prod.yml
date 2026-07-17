@@ -13,13 +13,13 @@
 # ⚠️ Postgres fica exposto (scripts do MacBook conectam direto via DATABASE_URL).
 #    Restrinja a porta 5432 no firewall da VPS ao seu IP, ou use Tailscale.
 
-name: fulled-stack
+name: fulled-stack-prod
 
 services:
 
   postgres:
     image: postgres:17
-    container_name: fulled-postgres
+    container_name: fulled-prod-postgres
     environment:
       POSTGRES_DB: fulled
       POSTGRES_USER: fulled
@@ -40,7 +40,7 @@ services:
   # Init container: aplica schema base + migrations em ordem e encerra (idempotente).
   migrator:
     image: postgres:17
-    container_name: fulled-migrator
+    container_name: fulled-prod-migrator
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,7 +68,7 @@ services:
   fastapi:
     build:
       context: ./api
-    container_name: fulled-fastapi
+    container_name: fulled-prod-fastapi
     ports:
       - "${API_PORT:-8000}:8000"
     environment:
@@ -82,6 +82,7 @@ services:
       GCP_SC_KEY: ${GCP_SC_KEY:-}
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      SUPABASE_ADMIN_USER_ID: ${SUPABASE_ADMIN_USER_ID:-}
       DATA_DIR: /data/leadgen
     volumes:
       # Na VPS não existe o path do Mac — volume nomeado (cache SerpAPI, parquets)
@@ -98,7 +99,7 @@ services:
   frontend:
     build:
       context: ./frontend
-    container_name: fulled-frontend
+    container_name: fulled-prod-frontend
     ports:
       - "${FRONTEND_PORT:-3001}:80"
     depends_on:
@@ -110,7 +111,7 @@ services:
   # Backup diário do Postgres — dump comprimido, retenção de 14 dias.
   backup:
     image: postgres:17
-    container_name: fulled-backup
+    container_name: fulled-prod-backup
     depends_on:
       postgres:
         condition: service_healthy

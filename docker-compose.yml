@@ -1,6 +1,5 @@
 # Full AIOS STACK — Mission Control (infra compartilhada)
 # Sobe: postgres + migrator + fastapi + frontend
-# Servicos de operacao LeadGen (polling, sc-sync) rodam separados em Full_AIOS_LEADGEN
 #
 # Uso:
 #   1) cp .env.example .env  &&  preencher variaveis
@@ -92,7 +91,6 @@ services:
       context: ./frontend
     container_name: fulled-frontend
     ports:
-      # 3000 reservada ao Multica — usamos 3001 para o Gate 1 dashboard
       - "3001:80"
     depends_on:
       - fastapi
