@@ -1,0 +1,106 @@
+# Full AIOS STACK — Mission Control (infra compartilhada)
+# Sobe: postgres + migrator + fastapi + frontend
+#
+# Uso:
+#   1) cp .env.example .env  &&  preencher variaveis
+#   2) docker compose up -d --build
+
+name: fulled-stack
+
+services:
+
+  postgres:
+    image: postgres:17
+    container_name: fulled-postgres
+    environment:
+      POSTGRES_DB: fulled
+      POSTGRES_USER: fulled
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fulled -d fulled"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - fulled-stack
+
+  # Init container: aplica schema base + migrations em ordem e encerra.
+  # Todos os arquivos sao idempotentes (CREATE/ALTER ... IF NOT EXISTS).
+  migrator:
+    image: postgres:17
+    container_name: fulled-migrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./api/schema.sql:/sql/schema.sql:ro
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo "[migrator] aplicando schema base..."
+        psql -h postgres -U fulled -d fulled -v ON_ERROR_STOP=1 -f /sql/schema.sql
+        for f in /migrations/*.sql; do
+          echo "[migrator] aplicando $$f..."
+          psql -h postgres -U fulled -d fulled -v ON_ERROR_STOP=1 -f "$$f"
+        done
+        echo "[migrator] todas as migrations aplicadas com sucesso."
+    restart: "no"
+    networks:
+      - fulled-stack
+
+  fastapi:
+    build:
+      context: ./api
+    container_name: fulled-fastapi
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgres://fulled:${POSTGRES_PASSWORD}@postgres:5432/fulled
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      DASHBOARD_USER: ${DASHBOARD_USER:-}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+      AUTH_SECRET: ${AUTH_SECRET:-}
+      STACK_API_KEY: ${STACK_API_KEY:-}
+      GCP_SC_KEY: ${GCP_SC_KEY:-}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+    volumes:
+      # Full_AIOS_Data esta fora do repo STACK — usar path absoluto
+      - /Users/felipefull/Documents/Full_AIOS/Full_AIOS_Data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - fulled-stack
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: fulled-frontend
+    ports:
+      - "3001:80"
+    depends_on:
+      - fastapi
+    restart: unless-stopped
+    networks:
+      - fulled-stack
+
+volumes:
+  pgdata:
+
+networks:
+  fulled-stack:
+    driver: bridge

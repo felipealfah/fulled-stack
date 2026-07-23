@@ -1,25 +1,24 @@
 """ranking.py — GET /projetos/{id}/ranking
 
-Le ranking_dashboard e ranking_history do BigQuery (leadgen_gold).
+Le ranking_dashboard_cache e ranking_history_cache do Postgres local.
 Phase 03: migrado de DuckDB/Parquet para BQ.
+2026-07-23: migrado de BQ live para cache Postgres — o workflow n8n
+"[LEADGEN] Sync Gold → Postgres" (05:00) puxa o gold do BQ 1x/dia e grava
+nas tabelas *_cache. A API não consulta mais o BigQuery.
+Ver ADR 2026-07-23_Ranking_Cache_Postgres_n8n (Full_AIOS_LEADGEN).
 
-Se dados nao existirem no BQ: {"status": "not_ready", "message": "..."}
+Se dados nao existirem no cache (sync ainda nao rodou): {"status": "not_ready", ...}
 Se projeto nao existir: 404
 """
 
-import base64
-import json
-import math
-import os
 import re
 import unicodedata
 from pathlib import Path
 from typing import Optional
 
+import asyncpg
 import pandas as pd
 from fastapi import APIRouter, HTTPException
-from google.cloud import bigquery
-from google.oauth2 import service_account
 
 from db import get_pool
 
@@ -27,22 +26,10 @@ router = APIRouter(prefix="/projetos", tags=["ranking"])
 
 DATA_DIR = Path("/data/leadgen")
 
-BQ_PROJECT_ID = "gifted-slice-357413"
-BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
-
-
-def _load_bq_client() -> bigquery.Client:
-    """Autentica SA leadgen-sc via GCP_SC_KEY env var."""
-    gcp_key_json = os.environ.get("GCP_SC_KEY") or os.environ.get("GCP_GADS_KEY")
-    if gcp_key_json:
-        if not gcp_key_json.strip().startswith("{"):
-            gcp_key_json = base64.b64decode(gcp_key_json).decode()
-        key_info = json.loads(gcp_key_json)
-        credentials = service_account.Credentials.from_service_account_info(
-            key_info, scopes=BQ_SCOPES
-        )
-        return bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials)
-    return bigquery.Client(project=BQ_PROJECT_ID)  # ADC fallback
+_NOT_READY_MSG = (
+    "Ranking ainda não sincronizado. O sync n8n (BQ → Postgres) roda diariamente "
+    "às 05:00 — ou execute o workflow '[LEADGEN] Sync Gold → Postgres' manualmente."
+)
 
 
 def _slugify(name: str) -> str:
@@ -63,10 +50,10 @@ def _slugify(name: str) -> str:
     return text
 
 
-def _compute_report(bq_client, projeto_id_int: int, projeto_nome: str) -> dict:
+def _compute_report(history_rows: list[dict], projeto_id_int: int, projeto_nome: str) -> dict:
     """Calcula relatório de ranking comparando último snapshot vs penúltimo.
 
-    Lê de leadgen_gold.ranking_history via BQ (substitui Parquet + DuckDB).
+    Lê de ranking_history_cache (Postgres) — recebe as rows já consultadas.
 
     Modos:
     - baseline: apenas 1 snapshot_date distinto → deltas null
@@ -74,22 +61,10 @@ def _compute_report(bq_client, projeto_id_int: int, projeto_nome: str) -> dict:
 
     Retorna dict pronto para serialização JSON (sem NaN — substituídos por None).
     """
-    from datetime import date
-
-    query = f"""
-        SELECT *
-        FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
-        WHERE projeto_id = @projeto_id
-        ORDER BY snapshot_date
-    """
-    job_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
-    ])
-    bq_rows = list(bq_client.query(query, job_config=job_config).result())
-    if not bq_rows:
+    if not history_rows:
         return {"status": "not_ready", "message": "Histórico ainda não disponível."}
 
-    df = pd.DataFrame([dict(r) for r in bq_rows])
+    df = pd.DataFrame(history_rows)
     df["snapshot_date"] = pd.to_datetime(df["snapshot_date"]).dt.date
 
     snapshot_dates = sorted(df["snapshot_date"].unique(), reverse=True)
@@ -246,20 +221,19 @@ async def get_ranking(projeto_id: str):
 
     projeto_id_int = row["id_int_legado"]
 
-    bq = _load_bq_client()
-    query = f"""
-        SELECT *
-        FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_dashboard`
-        WHERE projeto_id = @projeto_id
-        ORDER BY status, serp_position NULLS LAST
-    """
-    job_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
-    ])
     try:
-        rows = list(bq.query(query, job_config=job_config).result())
-    except Exception as e:
-        raise HTTPException(503, f"Erro ao consultar BigQuery: {e}")
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM ranking_dashboard_cache
+                WHERE projeto_id = $1
+                ORDER BY status, serp_position NULLS LAST
+                """,
+                projeto_id_int,
+            )
+    except asyncpg.UndefinedTableError:
+        return {"status": "not_ready", "message": _NOT_READY_MSG}
 
     if not rows:
         return {
@@ -267,16 +241,17 @@ async def get_ranking(projeto_id: str):
             "message": "Ranking ainda não processado para este projeto. Execute o agente rank_intel.",
         }
 
+    updated_at = None
     keywords = []
     for r in rows:
         kw = dict(r)
+        synced = kw.pop("synced_at", None)
+        if synced is not None and (updated_at is None or synced > updated_at):
+            updated_at = synced
         for k, v in kw.items():
             if hasattr(v, "isoformat"):
                 kw[k] = v.isoformat()
         keywords.append(kw)
-
-    from datetime import datetime, timezone
-    updated_at = datetime.now(timezone.utc).isoformat()
 
     return {
         "status": "ok",
@@ -285,7 +260,8 @@ async def get_ranking(projeto_id: str):
         "dominio": row["dominio"],
         "total": len(keywords),
         "keywords": keywords,
-        "updated_at": updated_at,
+        # última sincronização BQ → Postgres (não mais "agora")
+        "updated_at": updated_at.isoformat() if updated_at is not None else None,
     }
 
 
@@ -306,32 +282,31 @@ async def get_ranking_history(projeto_id: str, keyword: Optional[str] = None):
 
     projeto_id_int = row["id_int_legado"]
 
-    bq = _load_bq_client()
-    if keyword:
-        query = f"""
-            SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
-            FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
-            WHERE projeto_id = @projeto_id AND keyword = @keyword
-            ORDER BY keyword, snapshot_date
-        """
-        params = [
-            bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
-            bigquery.ScalarQueryParameter("keyword", "STRING", keyword),
-        ]
-    else:
-        query = f"""
-            SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
-            FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
-            WHERE projeto_id = @projeto_id
-            ORDER BY keyword, snapshot_date
-        """
-        params = [bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int)]
-
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
     try:
-        rows = list(bq.query(query, job_config=job_config).result())
-    except Exception as e:
-        raise HTTPException(503, f"Erro ao consultar BigQuery: {e}")
+        async with pool.acquire() as conn:
+            if keyword:
+                rows = await conn.fetch(
+                    """
+                    SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
+                    FROM ranking_history_cache
+                    WHERE projeto_id = $1 AND keyword = $2
+                    ORDER BY keyword, snapshot_date
+                    """,
+                    projeto_id_int,
+                    keyword,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
+                    FROM ranking_history_cache
+                    WHERE projeto_id = $1
+                    ORDER BY keyword, snapshot_date
+                    """,
+                    projeto_id_int,
+                )
+    except asyncpg.UndefinedTableError:
+        return {"status": "not_ready", "message": _NOT_READY_MSG}
 
     if not rows:
         return {
@@ -380,26 +355,27 @@ async def get_ranking_report(projeto_id: str):
 
     projeto_id_int = row["id_int_legado"]
 
-    bq = _load_bq_client()
-    check_query = f"""
-        SELECT COUNT(*) as n
-        FROM `{BQ_PROJECT_ID}.leadgen_gold.ranking_history`
-        WHERE projeto_id = @projeto_id
-    """
-    check_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("projeto_id", "INT64", projeto_id_int),
-    ])
     try:
-        n_rows = list(bq.query(check_query, job_config=check_config).result())[0]["n"]
-    except Exception as e:
-        raise HTTPException(503, f"Erro ao consultar BigQuery: {e}")
+        async with pool.acquire() as conn:
+            hist_rows = await conn.fetch(
+                """
+                SELECT keyword, snapshot_date, serp_position,
+                       sc_position_avg_30d, sc_impressions_30d, status
+                FROM ranking_history_cache
+                WHERE projeto_id = $1
+                ORDER BY snapshot_date
+                """,
+                projeto_id_int,
+            )
+    except asyncpg.UndefinedTableError:
+        return {"status": "not_ready", "message": _NOT_READY_MSG}
 
-    if n_rows == 0:
+    if not hist_rows:
         return {
             "status": "not_ready",
             "message": "Histórico de ranking ainda não disponível. Execute rank_intel ao menos uma vez.",
         }
-    return _compute_report(bq, projeto_id_int, row["projeto_nome"])
+    return _compute_report([dict(r) for r in hist_rows], projeto_id_int, row["projeto_nome"])
 
 
 @router.get("/{projeto_id}/seo-yaml-template")

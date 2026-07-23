@@ -25,7 +25,9 @@ services:
       POSTGRES_USER: fulled
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Bind só no localhost da VPS — acesso externo é via túnel SSH (vps_tunnel.sh),
+      # nunca porta aberta na internet. O túnel conecta em localhost:5432 da VPS.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
