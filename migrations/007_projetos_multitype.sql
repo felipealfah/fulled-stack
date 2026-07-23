@@ -15,9 +15,16 @@ ALTER TABLE projetos
   ADD COLUMN IF NOT EXISTS receita_mensal NUMERIC(10,2);
 
 -- 4. CHECK constraint em tipo (drop-and-recreate para idempotência)
+-- NOT VALID: o migrator re-executa TODAS as migrations a cada subida; sem NOT VALID,
+-- o replay desta migration quebra quando o banco já tem tipos adicionados por
+-- migrations posteriores (ex: 'prospeccao' na 025) — "check constraint is violated
+-- by some row". NOT VALID pula a validação das rows existentes mas segue valendo
+-- para INSERT/UPDATE novos. A lista vigente é sempre a da última migration que
+-- recria o constraint (hoje: 025).
 ALTER TABLE projetos
   DROP CONSTRAINT IF EXISTS projetos_tipo_check;
 
 ALTER TABLE projetos
   ADD CONSTRAINT projetos_tipo_check
-  CHECK (tipo IN ('rank_rent', 'infoproduto', 'youtube_faceless', 'facebook_faceless'));
+  CHECK (tipo IN ('rank_rent', 'infoproduto', 'youtube_faceless', 'facebook_faceless'))
+  NOT VALID;
