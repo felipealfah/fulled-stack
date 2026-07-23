@@ -169,7 +169,7 @@ export function RankingRelatorio() {
               <th className="py-2 px-3 text-left">Keyword</th>
               <th className="py-2 px-3 text-right">SERP</th>
               <th className="py-2 px-3 text-right">SC Pos</th>
-              <th className="py-2 px-3 text-right">Impressões 30d</th>
+              <th className="py-2 px-3 text-right">Impressões 7d</th>
             </tr>
           </thead>
           <tbody>
@@ -239,7 +239,7 @@ export function RankingRelatorio() {
           <thead>
             <tr className="text-xs font-mono text-gray-500 border-b border-gray-800">
               <th className="py-2 px-3 text-left">Keyword</th>
-              <th className="py-2 px-3 text-right">Impressões 30d</th>
+              <th className="py-2 px-3 text-right">Impressões 7d</th>
             </tr>
           </thead>
           <tbody>
@@ -264,7 +264,7 @@ export function RankingRelatorio() {
                 <th className="py-2 px-3 text-left">Keyword</th>
                 <th className="py-2 px-3 text-left">Status</th>
                 <th className="py-2 px-3 text-right">SC Pos</th>
-                <th className="py-2 px-3 text-right">Impressões 30d</th>
+                <th className="py-2 px-3 text-right">Impressões 7d</th>
               </tr>
             </thead>
             <tbody>

@@ -336,10 +336,10 @@ function InsightsTab({ keywords }: { keywords: RankingRow[] }) {
           Receita Orgânica Estimada
         </p>
         <p className="font-mono text-2xl text-emerald-400">
-          {fmtBRL(receitaTotal)}<span className="text-sm text-gray-600">/mês</span>
+          {fmtBRL(receitaTotal)}<span className="text-sm text-gray-600">/7 dias</span>
         </p>
         <p className="font-mono text-[10px] text-gray-700 mt-1">
-          Baseado em CPC × cliques SC 30d · apenas keywords com status RANKEANDO
+          Baseado em CPC × cliques SC 7d · apenas keywords com status RANKEANDO
         </p>
       </div>
 
@@ -396,7 +396,7 @@ function InsightsTab({ keywords }: { keywords: RankingRow[] }) {
             <thead>
               <tr className="border-b border-gray-800">
                 <th className="px-4 py-2 text-[10px] text-gray-600 uppercase tracking-wider text-left">Query SC</th>
-                <th className="px-4 py-2 text-[10px] text-gray-600 uppercase tracking-wider text-right">Impressões 30d</th>
+                <th className="px-4 py-2 text-[10px] text-gray-600 uppercase tracking-wider text-right">Impressões 7d</th>
                 <th className="px-4 py-2 text-[10px] text-gray-600 uppercase tracking-wider text-right">CTR</th>
               </tr>
             </thead>
@@ -657,8 +657,8 @@ export function ProjetoRanking() {
                       {sh('Pos. SC', 'sc_position')}
                       {sh('Pos. SRP', 'srp_position')}
                       {sh('Status', 'status', 'left')}
-                      {sh('Impressões 30d', 'sc_impressions_30d')}
-                      {sh('Cliques 30d', 'sc_clicks_30d')}
+                      {sh('Impressões 7d', 'sc_impressions_30d')}
+                      {sh('Cliques 7d', 'sc_clicks_30d')}
                       {sh('Δ Pos', 'srp_position')}
                       {sh('Volume', 'avg_monthly_searches')}
                       {sh('Receita Est.', 'receita_potencial')}
