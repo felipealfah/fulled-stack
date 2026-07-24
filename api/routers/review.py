@@ -5,6 +5,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+import asyncpg
 from fastapi import APIRouter, HTTPException
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -106,61 +107,89 @@ async def create_pesquisa(body: PesquisaCreate):
     keywords com status='pending'.
     """
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            pesquisa_row = await conn.fetchrow(
-                """
-                INSERT INTO pesquisas (
-                    projeto_nome, nicho, cidade, geo_target_id, status,
-                    papel, projeto_id_uuid, avaliacao_json, seed_keywords
-                )
-                VALUES ($1, $2, $3, $4, 'classificado', $5, $6::uuid, $7::jsonb, $8::jsonb)
-                RETURNING *
-                """,
-                body.projeto_nome,
-                body.nicho,
-                body.cidade,
-                body.geo_target_id,
-                body.papel,
-                body.projeto_id,
-                json.dumps(body.avaliacao_json) if body.avaliacao_json is not None else None,
-                json.dumps(body.seed_keywords) if body.seed_keywords is not None else None,
-            )
-            pesquisa_id = pesquisa_row["id"]
+    pesquisa_row = None
+    inserted = 0
 
-            kw_rows = [
-                k for k in body.keywords
-                if not (body.skip_descarta and k.kw_type == "DESCARTA")
-            ]
-            inserted = 0
-            if kw_rows:
-                values = []
-                params: list = []
-                for i, k in enumerate(kw_rows):
-                    base = i * 9
-                    values.append(
-                        f"(${base+1}::uuid, ${base+2}, ${base+3}, ${base+4}, "
-                        f"${base+5}, ${base+6}, ${base+7}, ${base+8}, ${base+9}, 'pending')"
+    async with pool.acquire() as conn:
+        # Wrapper try captura UniqueViolation após o rollback automático da
+        # transaction (asyncpg lança InFailedSQLTransactionError se tentarmos
+        # SELECT dentro da txn abortada — por isso o SELECT fica fora).
+        try:
+            async with conn.transaction():
+                pesquisa_row = await conn.fetchrow(
+                    """
+                    INSERT INTO pesquisas (
+                        projeto_nome, nicho, cidade, geo_target_id, status,
+                        papel, projeto_id_uuid, avaliacao_json, seed_keywords
                     )
-                    params.extend([
-                        pesquisa_id,
-                        k.keyword,
-                        k.kw_type,
-                        k.avg_monthly_searches,
-                        k.bid_pos5_8_brl,
-                        k.bid_pos1_4_brl,
-                        k.competition_index,
-                        str(k.competition) if k.competition is not None else None,
-                        k.board_note,
-                    ])
-                sql = (
-                    "INSERT INTO kw_staging (pesquisa_id, keyword, kw_type, "
-                    "avg_monthly_searches, bid_pos5_8_brl, bid_pos1_4_brl, "
-                    "competition_index, competition, board_note, status) VALUES "
-                    + ", ".join(values)
+                    VALUES ($1, $2, $3, $4, 'classificado', $5, $6::uuid, $7::jsonb, $8::jsonb)
+                    RETURNING *
+                    """,
+                    body.projeto_nome,
+                    body.nicho,
+                    body.cidade,
+                    body.geo_target_id,
+                    body.papel,
+                    body.projeto_id,
+                    json.dumps(body.avaliacao_json) if body.avaliacao_json is not None else None,
+                    json.dumps(body.seed_keywords) if body.seed_keywords is not None else None,
                 )
-                await conn.execute(sql, *params)
-                inserted = len(kw_rows)
+                pesquisa_id = pesquisa_row["id"]
+
+                kw_rows = [
+                    k for k in body.keywords
+                    if not (body.skip_descarta and k.kw_type == "DESCARTA")
+                ]
+                if kw_rows:
+                    values = []
+                    params: list = []
+                    for i, k in enumerate(kw_rows):
+                        base = i * 9
+                        values.append(
+                            f"(${base+1}::uuid, ${base+2}, ${base+3}, ${base+4}, "
+                            f"${base+5}, ${base+6}, ${base+7}, ${base+8}, ${base+9}, 'pending')"
+                        )
+                        params.extend([
+                            pesquisa_id,
+                            k.keyword,
+                            k.kw_type,
+                            k.avg_monthly_searches,
+                            k.bid_pos5_8_brl,
+                            k.bid_pos1_4_brl,
+                            k.competition_index,
+                            str(k.competition) if k.competition is not None else None,
+                            k.board_note,
+                        ])
+                    sql = (
+                        "INSERT INTO kw_staging (pesquisa_id, keyword, kw_type, "
+                        "avg_monthly_searches, bid_pos5_8_brl, bid_pos1_4_brl, "
+                        "competition_index, competition, board_note, status) VALUES "
+                        + ", ".join(values)
+                    )
+                    await conn.execute(sql, *params)
+                    inserted = len(kw_rows)
+        except asyncpg.UniqueViolationError:
+            # REQ-8-08 / CRIT-5: retry após timeout retorna 409 com pesquisa_id
+            # existente para skill tratar como sucesso. A UNIQUE natural
+            # pesquisas_natural_key cobre (nicho, cidade, projeto_id_uuid, papel).
+            # A transaction já sofreu rollback automático via context manager
+            # do asyncpg — kw_staging não fica com row órfã (T5 do teste).
+            # IS NOT DISTINCT FROM trata NULL corretamente.
+            existing = await conn.fetchrow(
+                """SELECT id FROM pesquisas
+                    WHERE nicho = $1
+                      AND cidade = $2
+                      AND projeto_id_uuid IS NOT DISTINCT FROM $3::uuid
+                      AND papel IS NOT DISTINCT FROM $4""",
+                body.nicho, body.cidade, body.projeto_id, body.papel,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "Pesquisa já existe",
+                    "pesquisa_id": str(existing["id"]) if existing else None,
+                },
+            )
 
     return {
         "pesquisa": dict(pesquisa_row),
