@@ -19,6 +19,7 @@ from routers.geo_targets import router as geo_targets_router
 from routers.content import router as content_router
 from routers.prospeccao import router as prospeccao_router
 from routers.financeiro import router as financeiro_router
+from routers.keywords import router as keywords_router
 
 
 @asynccontextmanager
@@ -74,6 +75,7 @@ app.include_router(geo_targets_router)
 app.include_router(content_router)
 app.include_router(prospeccao_router)
 app.include_router(financeiro_router)
+app.include_router(keywords_router)
 
 
 @app.get("/health")
