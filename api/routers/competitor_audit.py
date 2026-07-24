@@ -10,7 +10,7 @@ Uso pelo agente `/competitor-audit` após scraping de top 3 concorrentes orgâni
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -61,9 +61,17 @@ async def upsert_competitor_audit(projeto_id: str, body: CompetitorAuditPayload)
                 )
 
             try:
-                generated_at = datetime.fromisoformat(body.generated_at)
+                # `Z` sufixo virou compatível com fromisoformat em 3.11+, mas normalizamos
+                # para robustez com clientes que mandem "2026-07-24T18:00:00Z"
+                generated_at = datetime.fromisoformat(body.generated_at.replace("Z", "+00:00"))
             except ValueError:
                 raise HTTPException(422, "generated_at deve ser ISO 8601")
+
+            # Coluna competitor_audits.generated_at é TIMESTAMP (sem TZ).
+            # asyncpg falha ao encodar datetime aware contra TIMESTAMP — remover tz
+            # (assumido UTC pelo cliente que padroniza ISO 8601 com Z ou offset explícito).
+            if generated_at.tzinfo is not None:
+                generated_at = generated_at.astimezone(timezone.utc).replace(tzinfo=None)
 
             gaps = body.market_gaps
             row = await conn.fetchrow(
