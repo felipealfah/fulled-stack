@@ -23,6 +23,7 @@ from routers.keywords import router as keywords_router
 from routers.competitor_audit import router as competitor_audit_router
 from routers.backlink_intel import router as backlink_intel_router
 from routers.intel import router as intel_router
+from routers.rank_tracking import router as rank_tracking_router
 
 
 @asynccontextmanager
@@ -85,6 +86,8 @@ app.include_router(financeiro_router)
 app.include_router(keywords_router)
 app.include_router(competitor_audit_router)
 app.include_router(backlink_intel_router)
+# rank_tracking_router antes de projetos.router para evitar colisão de rotas
+app.include_router(rank_tracking_router)
 
 
 @app.get("/health")
