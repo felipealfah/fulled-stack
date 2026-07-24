@@ -72,6 +72,102 @@ class ApproveRequest(BaseModel):
     approved_keywords: list[str]  # textos das keywords aprovadas
 
 
+class KeywordInput(BaseModel):
+    keyword: str
+    kw_type: str  # PAGINA_PRINCIPAL | SERVICO | PAGINA_GEO | SECAO | DESCARTA
+    avg_monthly_searches: int | None = None
+    bid_pos5_8_brl: float | None = None
+    bid_pos1_4_brl: float | None = None
+    competition_index: float | None = None
+    competition: str | int | None = None
+    board_note: str | None = None
+
+
+class PesquisaCreate(BaseModel):
+    projeto_nome: str
+    nicho: str
+    cidade: str = "Brasília"
+    geo_target_id: str | None = None
+    papel: str | None = None  # 'principal' | 'servico' | None
+    projeto_id: str | None = None  # UUID do projeto (opcional)
+    avaliacao_json: dict | None = None
+    seed_keywords: list[str] | None = None
+    keywords: list[KeywordInput] = []
+    skip_descarta: bool = True  # não insere kw_staging com kw_type=DESCARTA
+
+
+@router.post("/")
+async def create_pesquisa(body: PesquisaCreate):
+    """Cria pesquisa + kw_staging em uma única transação.
+
+    Usado pelo agente `/kw-validator` para persistir o resultado do
+    kw_research + classificação. A pesquisa nasce com status='pending_review'
+    e as keywords com status='pending' — Board revisa via dashboard /kw-planner.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            pesquisa_row = await conn.fetchrow(
+                """
+                INSERT INTO pesquisas (
+                    projeto_nome, nicho, cidade, geo_target_id, status,
+                    papel, projeto_id_uuid, avaliacao_json, seed_keywords
+                )
+                VALUES ($1, $2, $3, $4, 'pending_review', $5, $6::uuid, $7::jsonb, $8::jsonb)
+                RETURNING *
+                """,
+                body.projeto_nome,
+                body.nicho,
+                body.cidade,
+                body.geo_target_id,
+                body.papel,
+                body.projeto_id,
+                json.dumps(body.avaliacao_json) if body.avaliacao_json is not None else None,
+                json.dumps(body.seed_keywords) if body.seed_keywords is not None else None,
+            )
+            pesquisa_id = pesquisa_row["id"]
+
+            kw_rows = [
+                k for k in body.keywords
+                if not (body.skip_descarta and k.kw_type == "DESCARTA")
+            ]
+            inserted = 0
+            if kw_rows:
+                values = []
+                params: list = []
+                for i, k in enumerate(kw_rows):
+                    base = i * 9
+                    values.append(
+                        f"(${base+1}::uuid, ${base+2}, ${base+3}, ${base+4}, "
+                        f"${base+5}, ${base+6}, ${base+7}, ${base+8}, ${base+9}, 'pending')"
+                    )
+                    params.extend([
+                        pesquisa_id,
+                        k.keyword,
+                        k.kw_type,
+                        k.avg_monthly_searches,
+                        k.bid_pos5_8_brl,
+                        k.bid_pos1_4_brl,
+                        k.competition_index,
+                        str(k.competition) if k.competition is not None else None,
+                        k.board_note,
+                    ])
+                sql = (
+                    "INSERT INTO kw_staging (pesquisa_id, keyword, kw_type, "
+                    "avg_monthly_searches, bid_pos5_8_brl, bid_pos1_4_brl, "
+                    "competition_index, competition, board_note, status) VALUES "
+                    + ", ".join(values)
+                )
+                await conn.execute(sql, *params)
+                inserted = len(kw_rows)
+
+    return {
+        "pesquisa": dict(pesquisa_row),
+        "keywords_inseridas": inserted,
+        "keywords_ignoradas_descarta": len(body.keywords) - inserted,
+    }
+
+
 @router.get("/{pesquisa_id}")
 async def get_pesquisa(pesquisa_id: str):
     pool = await get_pool()
