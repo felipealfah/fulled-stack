@@ -22,6 +22,7 @@ from routers.financeiro import router as financeiro_router
 from routers.keywords import router as keywords_router
 from routers.competitor_audit import router as competitor_audit_router
 from routers.backlink_intel import router as backlink_intel_router
+from routers.intel import router as intel_router
 
 
 @asynccontextmanager
@@ -66,6 +67,10 @@ async def auth_middleware(request: Request, call_next):
 
 
 app.include_router(auth_router)
+# intel_router antes de review.router — o path /pesquisas/{id}/keywords/bulk-intel
+# colide com PATCH /pesquisas/{id}/keywords/{keyword_id} do review.py (keyword_id=int).
+# FastAPI resolve na ordem de registro — mais específico primeiro.
+app.include_router(intel_router)
 app.include_router(review.router)
 app.include_router(projects.router)
 app.include_router(projetos.router)
