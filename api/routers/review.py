@@ -101,8 +101,9 @@ async def create_pesquisa(body: PesquisaCreate):
     """Cria pesquisa + kw_staging em uma única transação.
 
     Usado pelo agente `/kw-validator` para persistir o resultado do
-    kw_research + classificação. A pesquisa nasce com status='pending_review'
-    e as keywords com status='pending' — Board revisa via dashboard /kw-planner.
+    kw_research + classificação. A pesquisa nasce com status='classificado'
+    (kw-validator já classificou — Gate 2 no dashboard /kw-planner) e as
+    keywords com status='pending'.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -113,7 +114,7 @@ async def create_pesquisa(body: PesquisaCreate):
                     projeto_nome, nicho, cidade, geo_target_id, status,
                     papel, projeto_id_uuid, avaliacao_json, seed_keywords
                 )
-                VALUES ($1, $2, $3, $4, 'pending_review', $5, $6::uuid, $7::jsonb, $8::jsonb)
+                VALUES ($1, $2, $3, $4, 'classificado', $5, $6::uuid, $7::jsonb, $8::jsonb)
                 RETURNING *
                 """,
                 body.projeto_nome,
