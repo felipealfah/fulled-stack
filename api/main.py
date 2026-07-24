@@ -21,6 +21,7 @@ from routers.prospeccao import router as prospeccao_router
 from routers.financeiro import router as financeiro_router
 from routers.keywords import router as keywords_router
 from routers.competitor_audit import router as competitor_audit_router
+from routers.backlink_intel import router as backlink_intel_router
 
 
 @asynccontextmanager
@@ -78,6 +79,7 @@ app.include_router(prospeccao_router)
 app.include_router(financeiro_router)
 app.include_router(keywords_router)
 app.include_router(competitor_audit_router)
+app.include_router(backlink_intel_router)
 
 
 @app.get("/health")
