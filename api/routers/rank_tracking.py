@@ -21,7 +21,6 @@ Autenticação com BQ via GCP_SC_KEY no env do container fastapi.
 Auth HTTP via middleware — decisão D-09.
 """
 
-import json
 import os
 import sys
 from datetime import date
@@ -33,7 +32,7 @@ from google.oauth2 import service_account
 from pydantic import BaseModel
 
 from db import get_pool
-from routers._common import _resolve_projeto
+from routers._common import _load_gcp_key, _resolve_projeto
 
 router = APIRouter(prefix="/projetos", tags=["rank-tracking"])
 
@@ -53,12 +52,10 @@ def _get_bq_client() -> bigquery.Client | None:
     global _bq_client
     if _bq_client is not None:
         return _bq_client
-    gcp_key_json = os.environ.get("GCP_SC_KEY")
-    if not gcp_key_json:
-        print("[WARN] GCP_SC_KEY não configurada — rank_tracking BQ writes desabilitados", file=sys.stderr)
+    key_info = _load_gcp_key("GCP_SC_KEY")
+    if not key_info:
         return None
     try:
-        key_info = json.loads(gcp_key_json)
         credentials = service_account.Credentials.from_service_account_info(
             key_info, scopes=_BQ_SCOPES
         )
