@@ -144,6 +144,20 @@ class ProjetoUpdate(BaseModel):
     receita_mensal: float | None = None
 
 
+class AgentExecutionByProjetoCreate(BaseModel):
+    """Body para POST /projetos/{id}/agent-executions (Plan 12-02).
+
+    `pesquisa_id` opcional — permite site-builder rodar sem pesquisa aprovada.
+    Handler grava AMBOS `projeto_id` (INT via id_int_legado) e
+    `projeto_id_uuid` (UUID) para preencher o dashboard scoped por projeto.
+    """
+    agent_name: str
+    status: str = "completed"  # pending | in_progress | completed | failed
+    pesquisa_id: str | None = None
+    analysis_version: int = 1
+    error_message: str | None = None
+
+
 @router.get("/")
 async def list_projetos(
     tipo: str | None = Query(default=None),
@@ -282,18 +296,19 @@ async def update_projeto(projeto_id: str, body: ProjetoUpdate):
         )
 
         # D-03: Disparar rank_intel quando projeto vai para 'publicado'
-        # Insere na fila agent_executions com projeto_id (INTEGER legado via id_int_legado)
+        # Insere na fila agent_executions populando AMBOS projeto_id (INT legado)
+        # E projeto_id_uuid (UUID moderno). Phase 12-02: sem popular UUID, o
+        # dashboard scoped por projeto não enxergava a execução.
         novo_status = fields.get("status")
         if novo_status == "publicado" and status_anterior != "publicado":
-            # Buscar id_int_legado para agent_executions (que ainda tem projeto_id INTEGER)
             id_int = await conn.fetchval(
                 "SELECT id_int_legado FROM projetos WHERE id = $1", projeto_id
             )
             await conn.execute(
                 """INSERT INTO agent_executions
-                   (projeto_id, analysis_version, agent_name, status, started_at)
-                   VALUES ($1, 1, 'rank_intel', 'pending', NOW())""",
-                id_int,
+                   (projeto_id, projeto_id_uuid, analysis_version, agent_name, status, started_at)
+                   VALUES ($1, $2::uuid, 1, 'rank_intel', 'pending', NOW())""",
+                id_int, projeto_id,
             )
             print(f"[projetos] rank_intel enfileirado para projeto_id={projeto_id} (id_int={id_int})", flush=True)
 
@@ -346,6 +361,81 @@ async def get_pipeline(projeto_id: str):
             projeto_id,
         )
     return [dict(r) for r in rows]
+
+
+@router.post("/{projeto_id}/agent-executions", status_code=201)
+async def create_execution_by_projeto(projeto_id: str, body: AgentExecutionByProjetoCreate):
+    """Cria agent_execution vinculada a projeto (pesquisa_id opcional).
+
+    Motivação Plan 12-02: skills content/site precisam registrar execuções
+    scoped por projeto — content-writer/content-reviewer preferencialmente
+    também vinculam à pesquisa (quando existe), site-builder roda antes de
+    ter pesquisa aprovada. Este endpoint substitui os `docker exec ... psql`
+    das 3 skills e o `POST /agent-executions/` legado (que exige pesquisa_id
+    obrigatório).
+
+    Popula AMBOS `projeto_id` (INT via id_int_legado, coluna legada) E
+    `projeto_id_uuid` (FK canônica pós-Phase 05) — assim o dashboard
+    scoped por projeto enxerga a execução.
+
+    Retorna 201 + `{id, projeto_id, status}`.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        proj = await _resolve_projeto_id_int_local(conn, projeto_id)
+        id_int = proj["id_int_legado"]
+
+        # Se pesquisa_id foi passado, validar que existe (soft check — não bloqueia se ausente)
+        if body.pesquisa_id:
+            pesq = await conn.fetchrow(
+                "SELECT id FROM pesquisas WHERE id = $1::uuid", body.pesquisa_id
+            )
+            if not pesq:
+                raise HTTPException(404, "Pesquisa informada não encontrada")
+
+        # Se status='completed', gravar completed_at automaticamente
+        completed_at_sql = "NOW()" if body.status == "completed" else "NULL"
+
+        row = await conn.fetchrow(
+            f"""INSERT INTO agent_executions
+                (projeto_id, projeto_id_uuid, pesquisa_id,
+                 analysis_version, agent_name, status,
+                 started_at, completed_at, error_message)
+                VALUES ($1, $2::uuid, $3, $4, $5, $6, NOW(), {completed_at_sql}, $7)
+                RETURNING id""",
+            id_int,
+            projeto_id,
+            body.pesquisa_id,
+            body.analysis_version,
+            body.agent_name,
+            body.status,
+            body.error_message,
+        )
+    return {
+        "id": row["id"],
+        "projeto_id": projeto_id,
+        "status": body.status,
+    }
+
+
+async def _resolve_projeto_id_int_local(conn, projeto_id: str) -> dict:
+    """Resolve UUID → {"id_int_legado": int}. 404 se projeto não existe.
+    Definido aqui para evitar acoplamento circular com _common quando o
+    handler novo virou permanente. Se `id_int_legado` for None (projeto
+    criado antes da Phase 05), levanta 422 com mensagem clara.
+    """
+    row = await conn.fetchrow(
+        "SELECT id, id_int_legado FROM projetos WHERE id = $1::uuid", projeto_id,
+    )
+    if not row:
+        raise HTTPException(404, "Projeto não encontrado")
+    if row["id_int_legado"] is None:
+        raise HTTPException(
+            422,
+            "Projeto sem id_int_legado — agent_executions ainda usa FK INTEGER "
+            "para retro-compat; rode o backfill da Phase 05 antes de usar este endpoint.",
+        )
+    return {"id": row["id"], "id_int_legado": row["id_int_legado"]}
 
 
 @router.get("/{projeto_id}/audit")
