@@ -22,21 +22,27 @@ class AgentExecutionUpdate(BaseModel):
 
 @router.post("/")
 async def create_execution(body: AgentExecutionCreate):
-    """Registra início de execução de um agente. Retorna o execution_id."""
+    """Registra início de execução de um agente. Retorna o execution_id.
+
+    Phase 12-02 fix: também popula `projeto_id_uuid` via lookup em `pesquisas`
+    — antes desta correção, o dashboard scoped por projeto (que consulta
+    `projeto_id_uuid`) não enxergava execuções criadas por este endpoint.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         pesquisa = await conn.fetchrow(
-            "SELECT id FROM pesquisas WHERE id = $1", body.pesquisa_id
+            "SELECT id, projeto_id_uuid FROM pesquisas WHERE id = $1", body.pesquisa_id
         )
         if not pesquisa:
             raise HTTPException(404, "Pesquisa não encontrada")
 
         row = await conn.fetchrow(
             """INSERT INTO agent_executions
-               (pesquisa_id, analysis_version, agent_name, status, started_at)
-               VALUES ($1, $2, $3, $4, NOW())
+               (pesquisa_id, projeto_id_uuid, analysis_version, agent_name, status, started_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())
                RETURNING id""",
-            body.pesquisa_id, body.analysis_version, body.agent_name, body.status,
+            body.pesquisa_id, pesquisa["projeto_id_uuid"],
+            body.analysis_version, body.agent_name, body.status,
         )
     return {"id": row["id"], "status": body.status}
 
