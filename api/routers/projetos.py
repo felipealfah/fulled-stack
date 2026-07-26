@@ -162,29 +162,37 @@ class AgentExecutionByProjetoCreate(BaseModel):
 async def list_projetos(
     tipo: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    id_int_legado: int | None = Query(
+        default=None,
+        description="Filtro exato pelo ID inteiro legado (KWMGMT-06)",
+    ),
 ):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if tipo and status:
-            rows = await conn.fetch(
-                "SELECT * FROM projetos WHERE tipo = $1 AND status = $2 ORDER BY created_at DESC",
-                tipo,
-                status,
-            )
-        elif tipo:
-            rows = await conn.fetch(
-                "SELECT * FROM projetos WHERE tipo = $1 ORDER BY created_at DESC",
-                tipo,
-            )
-        elif status:
-            rows = await conn.fetch(
-                "SELECT * FROM projetos WHERE status = $1 ORDER BY created_at DESC",
-                status,
-            )
-        else:
-            rows = await conn.fetch(
-                "SELECT * FROM projetos ORDER BY created_at DESC"
-            )
+        where: list[str] = []
+        params: list = []
+        n = 1
+
+        if tipo:
+            where.append(f"tipo = ${n}")
+            params.append(tipo)
+            n += 1
+
+        if status:
+            where.append(f"status = ${n}")
+            params.append(status)
+            n += 1
+
+        if id_int_legado is not None:
+            where.append(f"id_int_legado = ${n}")
+            params.append(id_int_legado)
+            n += 1
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = await conn.fetch(
+            f"SELECT * FROM projetos {where_sql} ORDER BY created_at DESC",
+            *params,
+        )
     return [dict(r) for r in rows]
 
 
