@@ -16,3 +16,12 @@ ALTER TABLE kw_staging ADD CONSTRAINT kw_staging_kw_type_check
 -- Bloco A-2 — pesquisas.deleted_at para soft-delete (per KWMGMT-03, usado no Plan 32-03)
 ALTER TABLE pesquisas ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_pesquisas_deleted_at ON pesquisas(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- Bloco B (Plan 32-03) — CHECK tolerante em projeto_seo_plan_pages.difficulty_label
+-- Safety net: aceita valores canônicos LOW/MED/HIGH além dos pt (baixo/médio/alto)
+-- para casos de fallback no populate-intel.
+ALTER TABLE projeto_seo_plan_pages DROP CONSTRAINT IF EXISTS projeto_seo_plan_pages_difficulty_check;
+ALTER TABLE projeto_seo_plan_pages ADD CONSTRAINT projeto_seo_plan_pages_difficulty_check
+  CHECK (difficulty_label IN ('baixo', 'médio', 'alto', 'LOW', 'MED', 'HIGH') OR difficulty_label IS NULL) NOT VALID;
+
+-- Bloco C (Plan 32-04) será apendado neste mesmo arquivo pela wave 4 — content_pages expansão.

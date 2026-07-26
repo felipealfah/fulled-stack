@@ -22,6 +22,8 @@ from db import get_pool
 
 router = APIRouter(prefix="/projetos", tags=["seo-plan"])
 
+CANONICAL_TO_PT_DIFFICULTY = {"LOW": "baixo", "MED": "médio", "HIGH": "alto"}
+
 
 async def _resolve_projeto(conn, projeto_id: str) -> dict:
     """Resolve UUID para linha do projeto com id_int_legado."""
@@ -229,6 +231,7 @@ async def update_seo_plan_page(projeto_id: str, page_id: int, body: SeoPlanPageU
 
 # ---------------------------------------------------------------------------
 # PATCH /{projeto_id}/seo-plan/ready
+
 # ---------------------------------------------------------------------------
 
 @router.patch("/{projeto_id}/seo-plan/ready")
@@ -344,3 +347,73 @@ async def update_seo_plan_page_intel(projeto_id: str, page_id: int, body: SeoPla
         )
 
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /{projeto_id}/seo-plan/populate-intel
+# Phase 32 — Bulk populate intel from kw_staging into seo-plan pages
+# ---------------------------------------------------------------------------
+
+@router.post("/{projeto_id}/seo-plan/populate-intel")
+async def populate_intel(projeto_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        proj = await _resolve_projeto(conn, projeto_id)
+        pid_int = proj["id_int_legado"]
+        if pid_int is None:
+            raise HTTPException(422, "Projeto sem id_int_legado — não há seo_plan associado")
+
+        pages = await conn.fetch(
+            """SELECT p.id AS page_id, p.pesquisa_id, p.kw_principal_id
+               FROM projeto_seo_plan_pages p
+               JOIN projeto_seo_plan sp ON sp.id = p.plan_id
+               WHERE sp.projeto_id = $1 AND p.pesquisa_id IS NOT NULL""",
+            pid_int,
+        )
+
+        if not pages:
+            return {"pages_updated": 0, "pages_sem_intel": []}
+
+        pages_updated = 0
+        pages_sem_intel: list[int] = []
+
+        async with conn.transaction():
+            for pg in pages:
+                if pg["kw_principal_id"] is not None:
+                    intel = await conn.fetchrow(
+                        "SELECT competitive_score, difficulty_label, top_competitor_url FROM kw_staging WHERE id = $1",
+                        pg["kw_principal_id"],
+                    )
+                else:
+                    intel = await conn.fetchrow(
+                        """SELECT competitive_score, difficulty_label, top_competitor_url
+                           FROM kw_staging
+                           WHERE pesquisa_id = $1 AND competitive_score IS NOT NULL
+                           ORDER BY competitive_score DESC NULLS LAST
+                           LIMIT 1""",
+                        pg["pesquisa_id"],
+                    )
+
+                if intel is None or intel["competitive_score"] is None:
+                    pages_sem_intel.append(pg["page_id"])
+                    continue
+
+                mapped_difficulty = CANONICAL_TO_PT_DIFFICULTY.get(
+                    intel["difficulty_label"], intel["difficulty_label"]
+                )
+
+                await conn.execute(
+                    """UPDATE projeto_seo_plan_pages
+                       SET competitive_score = $2,
+                           difficulty_label = $3,
+                           top_competitor_url = $4,
+                           intel_updated_at = NOW()
+                       WHERE id = $1""",
+                    pg["page_id"],
+                    int(intel["competitive_score"]) if intel["competitive_score"] is not None else None,
+                    mapped_difficulty,
+                    intel["top_competitor_url"],
+                )
+                pages_updated += 1
+
+    return {"pages_updated": pages_updated, "pages_sem_intel": pages_sem_intel}

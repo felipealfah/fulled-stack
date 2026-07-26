@@ -11,6 +11,8 @@ ALLOWED_KW_TYPES = {
     "SECAO", "SURPRESA", "DESCARTA", "SERVICO"
 }
 
+PROJETO_STATUS_LIVE = ("deploy", "monetizacao", "manutencao")
+
 router = APIRouter(prefix="/pesquisas", tags=["kw-mgmt"])
 
 
@@ -73,3 +75,44 @@ async def bulk_reclassify(pesquisa_id: str, body: BulkReclassifyRequest):
                 updated += 1
 
     return {"updated": updated, "not_found": not_found, "invalid": invalid}
+
+
+@router.delete("/{pesquisa_id}")
+async def delete_pesquisa(pesquisa_id: str, force: bool = False):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """SELECT p.id, p.projeto_id_uuid, proj.status AS projeto_status,
+                          (SELECT COUNT(*) FROM kw_staging WHERE pesquisa_id = p.id) AS kw_count
+                   FROM pesquisas p
+                   LEFT JOIN projetos proj ON proj.id = p.projeto_id_uuid
+                   WHERE p.id = $1::uuid""",
+                pesquisa_id,
+            )
+        except Exception:
+            raise HTTPException(422, "pesquisa_id não é um UUID válido")
+
+        if not row:
+            raise HTTPException(404, "Pesquisa não encontrada")
+
+        if row["projeto_status"] in PROJETO_STATUS_LIVE and not force:
+            raise HTTPException(
+                409,
+                "Pesquisa pertence a projeto em produção (status=" + row["projeto_status"] + ") — passe ?force=true para forçar",
+            )
+
+        deleted_keywords = row["kw_count"]
+
+        async with conn.transaction():
+            await conn.execute("DELETE FROM kw_classification_overrides WHERE pesquisa_id = $1::uuid", pesquisa_id)
+            await conn.execute("DELETE FROM scorecard_overrides WHERE pesquisa_id = $1::uuid", pesquisa_id)
+            await conn.execute("DELETE FROM kw_scorecard WHERE pesquisa_id = $1::uuid", pesquisa_id)
+            await conn.execute("DELETE FROM agent_executions WHERE pesquisa_id = $1::uuid", pesquisa_id)
+            await conn.execute(
+                "UPDATE projetos SET pesquisa_id_atual = NULL WHERE pesquisa_id_atual = $1::uuid",
+                pesquisa_id,
+            )
+            await conn.execute("DELETE FROM pesquisas WHERE id = $1::uuid", pesquisa_id)
+
+    return {"deleted_keywords": deleted_keywords, "soft": False}

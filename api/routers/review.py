@@ -486,29 +486,7 @@ async def delete_keyword(pesquisa_id: str, keyword_id: int):
     return {"ok": True}
 
 
-@router.delete("/{pesquisa_id}")
-async def delete_pesquisa(pesquisa_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        pesquisa = await conn.fetchrow(
-            "SELECT id FROM pesquisas WHERE id = $1", pesquisa_id
-        )
-        if not pesquisa:
-            raise HTTPException(404, "Pesquisa não encontrada")
-
-        await conn.execute("DELETE FROM kw_classification_overrides WHERE pesquisa_id = $1", pesquisa_id)
-        await conn.execute("DELETE FROM scorecard_overrides WHERE pesquisa_id = $1", pesquisa_id)
-        await conn.execute("DELETE FROM kw_scorecard WHERE pesquisa_id = $1", pesquisa_id)
-        await conn.execute("DELETE FROM kw_staging WHERE pesquisa_id = $1", pesquisa_id)
-        await conn.execute("DELETE FROM agent_executions WHERE pesquisa_id = $1", pesquisa_id)
-        await conn.execute(
-            "UPDATE projetos SET pesquisa_id_atual = NULL WHERE pesquisa_id_atual = $1",
-            pesquisa_id,
-        )
-        await conn.execute("DELETE FROM pesquisas WHERE id = $1", pesquisa_id)
-
-    return {"ok": True}
-
+# NOTE: DELETE /pesquisas/{id} movido para kw_mgmt.py (Phase 32-03) com guard + soft/hard toggle.
 
 @router.post("/{pesquisa_id}/reject")
 async def reject_pesquisa(pesquisa_id: str):
