@@ -16,13 +16,29 @@ Phase 05: projeto_id no path é UUID (str). Queries em tabelas legadas usam id_i
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from db import get_pool
 
 router = APIRouter(prefix="/projetos", tags=["seo-plan"])
 
 CANONICAL_TO_PT_DIFFICULTY = {"LOW": "baixo", "MED": "médio", "HIGH": "alto"}
+
+TIPO_TO_PAGE_TYPE = {
+    "home": "home",
+    "servico": "service",
+    "servico_geo": "service_region",
+    "localidade": "localidade",
+}
+
+ALLOWED_KW_TYPES_PAGES = {
+    "PAGINA_PRINCIPAL", "PAGINA_GEO", "LOCALIDADE",
+    "SECAO", "SURPRESA", "DESCARTA", "SERVICO",
+}
+
+
+def _derive_page_slug(url: str) -> str:
+    return url.strip("/").split("/")[-1] or "home"
 
 
 async def _resolve_projeto(conn, projeto_id: str) -> dict:
@@ -417,3 +433,132 @@ async def populate_intel(projeto_id: str):
                 pages_updated += 1
 
     return {"pages_updated": pages_updated, "pages_sem_intel": pages_sem_intel}
+
+
+# ---------------------------------------------------------------------------
+# PUT /{projeto_id}/seo-plan/pages/sync
+# Phase 32 — Sync estrutural de páginas do vault em content_pages (KWMGMT-02)
+# ---------------------------------------------------------------------------
+
+class PageStructuralItem(BaseModel):
+    url: str
+    tipo: str
+    kw_type: str | None = None
+    titulo: str | None = None
+    meta_description: str | None = None
+    h1: str | None = None
+    keyword_primaria: str | None = None
+    pesquisa_id: str | None = None
+    papel_pesquisa: str | None = None
+    servico_pai: str | None = None
+    sem_volume: bool = False
+
+
+class SyncPagesRequest(BaseModel):
+    replace: bool = False
+    pages: list[PageStructuralItem] = Field(default=[], max_length=2000)
+
+
+@router.put("/{projeto_id}/seo-plan/pages/sync")
+async def sync_seo_plan_pages(projeto_id: str, body: SyncPagesRequest):
+    import uuid as _uuid
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        proj = await _resolve_projeto(conn, projeto_id)
+        pid_int = proj["id_int_legado"]
+        if pid_int is None:
+            raise HTTPException(422, "Projeto sem id_int_legado — impossível gravar em content_pages")
+        projeto_uuid_str = str(proj["id"])
+
+        invalid: list[dict] = []
+        valid: list[dict] = []
+
+        for page in body.pages:
+            if not page.url or not page.url.strip():
+                invalid.append({"url": page.url, "reason": "url vazia"})
+                continue
+            if page.tipo not in TIPO_TO_PAGE_TYPE:
+                invalid.append({"url": page.url, "reason": "tipo desconhecido: " + page.tipo})
+                continue
+            if page.kw_type is not None and page.kw_type not in ALLOWED_KW_TYPES_PAGES:
+                invalid.append({"url": page.url, "reason": "kw_type inválido: " + page.kw_type})
+                continue
+            pesquisa_id_val = None
+            if page.pesquisa_id:
+                try:
+                    _uuid.UUID(page.pesquisa_id)
+                    pesquisa_id_val = page.pesquisa_id
+                except ValueError:
+                    invalid.append({"url": page.url, "reason": "pesquisa_id não é UUID válido"})
+                    continue
+            valid.append({
+                "url": page.url.strip(),
+                "page_type": TIPO_TO_PAGE_TYPE[page.tipo],
+                "page_slug": _derive_page_slug(page.url),
+                "titulo": page.titulo,
+                "meta_description": page.meta_description,
+                "h1": page.h1,
+                "kw_type": page.kw_type,
+                "keyword_primaria": page.keyword_primaria,
+                "pesquisa_id": pesquisa_id_val,
+                "papel_pesquisa": page.papel_pesquisa,
+                "servico_pai": page.servico_pai,
+                "sem_volume": page.sem_volume,
+            })
+
+        created = 0
+        updated = 0
+        archived = 0
+
+        async with conn.transaction():
+            for v in valid:
+                row = await conn.fetchrow(
+                    """INSERT INTO content_pages (
+                         projeto_id, projeto_id_uuid, page_slug, page_type,
+                         url, titulo, meta_description, h1, kw_type, keyword_primaria,
+                         sem_volume, pesquisa_id, papel_pesquisa, servico_pai,
+                         synced_at, arquivada, status, created_at, updated_at
+                       ) VALUES (
+                         $1, $2::uuid, $3, $4,
+                         $5, $6, $7, $8, $9, $10,
+                         $11, $12::uuid, $13, $14,
+                         NOW(), false, 'gerado', NOW(), NOW()
+                       )
+                       ON CONFLICT (projeto_id, url) WHERE url IS NOT NULL DO UPDATE
+                         SET titulo           = EXCLUDED.titulo,
+                             meta_description = EXCLUDED.meta_description,
+                             h1               = EXCLUDED.h1,
+                             kw_type          = EXCLUDED.kw_type,
+                             keyword_primaria = EXCLUDED.keyword_primaria,
+                             sem_volume       = EXCLUDED.sem_volume,
+                             pesquisa_id      = EXCLUDED.pesquisa_id,
+                             papel_pesquisa   = EXCLUDED.papel_pesquisa,
+                             servico_pai      = EXCLUDED.servico_pai,
+                             synced_at        = NOW(),
+                             arquivada        = false,
+                             updated_at       = NOW()
+                       RETURNING (xmax = 0) AS was_inserted""",
+                    pid_int, projeto_uuid_str, v["page_slug"], v["page_type"],
+                    v["url"], v["titulo"], v["meta_description"], v["h1"],
+                    v["kw_type"], v["keyword_primaria"],
+                    v["sem_volume"], v["pesquisa_id"], v["papel_pesquisa"], v["servico_pai"],
+                )
+                if row["was_inserted"]:
+                    created += 1
+                else:
+                    updated += 1
+
+            if body.replace and valid:
+                payload_urls = [v["url"] for v in valid]
+                result = await conn.execute(
+                    """UPDATE content_pages
+                          SET arquivada = true, updated_at = NOW()
+                        WHERE projeto_id = $1
+                          AND url IS NOT NULL
+                          AND arquivada = false
+                          AND url <> ALL($2::text[])""",
+                    pid_int, payload_urls,
+                )
+                archived = int(result.split()[-1])
+
+    return {"created": created, "updated": updated, "archived": archived, "invalid": invalid}
