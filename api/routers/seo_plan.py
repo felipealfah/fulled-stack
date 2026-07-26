@@ -29,6 +29,12 @@ TIPO_TO_PAGE_TYPE = {
     "servico": "service",
     "servico_geo": "service_region",
     "localidade": "localidade",
+    # tipos produzidos pelo seo_plan.json (Phase 32 bug fix)
+    "geo": "geo",
+    "servicos": "servicos",
+    "quem-somos": "quem-somos",
+    "contato": "contato",
+    "politica": "politica",
 }
 
 ALLOWED_KW_TYPES_PAGES = {
