@@ -24,6 +24,7 @@ from routers.competitor_audit import router as competitor_audit_router
 from routers.backlink_intel import router as backlink_intel_router
 from routers.intel import router as intel_router
 from routers.rank_tracking import router as rank_tracking_router
+from routers.kw_mgmt import router as kw_mgmt_router
 
 
 @asynccontextmanager
@@ -68,6 +69,8 @@ async def auth_middleware(request: Request, call_next):
 
 
 app.include_router(auth_router)
+# kw_mgmt_router ANTES de review.router — evita colisão com PATCH /pesquisas/{id}/keywords/{keyword_id:int}
+app.include_router(kw_mgmt_router)
 # intel_router antes de review.router — o path /pesquisas/{id}/keywords/bulk-intel
 # colide com PATCH /pesquisas/{id}/keywords/{keyword_id} do review.py (keyword_id=int).
 # FastAPI resolve na ordem de registro — mais específico primeiro.
