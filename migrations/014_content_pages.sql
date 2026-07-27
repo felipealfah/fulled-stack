@@ -27,4 +27,4 @@ ALTER TABLE content_pages
   DROP CONSTRAINT IF EXISTS content_pages_page_type_check;
 ALTER TABLE content_pages
   ADD CONSTRAINT content_pages_page_type_check
-  CHECK (page_type IN ('home', 'service', 'service_region'));
+  CHECK (page_type IN ('home', 'service', 'service_region')) NOT VALID;
