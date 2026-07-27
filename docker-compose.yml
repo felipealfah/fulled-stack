@@ -85,6 +85,7 @@ services:
     restart: unless-stopped
     networks:
       - fulled-stack
+      - proxy_net
 
   frontend:
     build:
@@ -97,6 +98,7 @@ services:
     restart: unless-stopped
     networks:
       - fulled-stack
+      - proxy_net
 
 volumes:
   pgdata:
@@ -104,3 +106,5 @@ volumes:
 networks:
   fulled-stack:
     driver: bridge
+  proxy_net:
+    external: true
