@@ -8,6 +8,7 @@ import { ProjetoDetail } from './pages/ProjetoDetail'
 import { ProjetoRanking } from './pages/ProjetoRanking'
 import { ProjetoPipeline } from './pages/ProjetoPipeline'
 import { SeoPlan } from './pages/SeoPlan'
+import { ProjetoKeywords } from './pages/ProjetoKeywords'
 import { SeoAuditoria } from './pages/SeoAuditoria'
 import { RankingRelatorio } from './pages/RankingRelatorio'
 import { Sites } from './pages/Sites'
@@ -28,6 +29,7 @@ export function AppRouter() {
         <Route path="/projetos" element={<Projetos />} />
         <Route path="/projetos/:id" element={<ProjetoDetail />} />
         <Route path="/projetos/:id/ranking" element={<ProjetoRanking />} />
+        <Route path="/projetos/:id/keywords" element={<ProjetoKeywords />} />
         <Route path="/projetos/:id/seo-plan" element={<SeoPlan />} />
         <Route path="/projetos/:id/content" element={<ContentReview />} />
         <Route path="/projetos/:id/relatorio" element={<RankingRelatorio />} />

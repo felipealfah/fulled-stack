@@ -118,13 +118,24 @@ async def create_pesquisa(body: PesquisaCreate):
         # SELECT dentro da txn abortada — por isso o SELECT fica fora).
         try:
             async with conn.transaction():
+                # projeto_id (INT legado) precisa acompanhar o UUID. Endpoints
+                # antigos (approve-classified, promote-gold) ainda filtram pelo
+                # INT; deixá-lo NULL fazia esses filtros casarem zero linhas
+                # silenciosamente — ver migration 032 e keywords.py.
+                projeto_id_int = None
+                if body.projeto_id:
+                    projeto_id_int = await conn.fetchval(
+                        "SELECT id_int_legado FROM projetos WHERE id = $1::uuid",
+                        body.projeto_id,
+                    )
+
                 pesquisa_row = await conn.fetchrow(
                     """
                     INSERT INTO pesquisas (
                         projeto_nome, nicho, cidade, geo_target_id, status,
-                        papel, projeto_id_uuid, avaliacao_json, seed_keywords
+                        papel, projeto_id_uuid, projeto_id, avaliacao_json, seed_keywords
                     )
-                    VALUES ($1, $2, $3, $4, 'classificado', $5, $6::uuid, $7::jsonb, $8::jsonb)
+                    VALUES ($1, $2, $3, $4, 'classificado', $5, $6::uuid, $7::int, $8::jsonb, $9::jsonb)
                     RETURNING *
                     """,
                     body.projeto_nome,
@@ -133,6 +144,7 @@ async def create_pesquisa(body: PesquisaCreate):
                     body.geo_target_id,
                     body.papel,
                     body.projeto_id,
+                    projeto_id_int,
                     json.dumps(body.avaliacao_json) if body.avaliacao_json is not None else None,
                     json.dumps(body.seed_keywords) if body.seed_keywords is not None else None,
                 )
@@ -295,7 +307,19 @@ class PesquisaVincularUpdate(BaseModel):
 
 @router.post("/{pesquisa_id}/approve-gate2")
 async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGate2Request()):
+    """Gate do Board sobre UMA pesquisa: aprova a pesquisa E suas keywords.
+
+    Até 2026-08-03 este endpoint só mexia em `pesquisas.status` — as keywords
+    ficavam em kw_staging.status='pending' para sempre, porque o único lugar que
+    as aprovava era o `/seo-architect` (via approve-classified, que estava quebrado
+    pelo mesmo bug de projeto_id). Resultado: o Board "aprovava" e nada acontecia
+    a jusante. Agora a aprovação da pesquisa arrasta as keywords não-DESCARTA.
+
+    Para aprovação granular (seleção linha a linha, reclassificação, rejeição),
+    usar `POST /projetos/{id}/keywords/approve`.
+    """
     pool = await get_pool()
+    keywords_aprovadas = 0
     async with pool.acquire() as conn:
         pesquisa = await conn.fetchrow(
             "SELECT * FROM pesquisas WHERE id = $1", pesquisa_id
@@ -318,22 +342,49 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
                 pesquisa["cidade"],
                 pesquisa_id,
             )
-            projeto_id = row["id"]
+            projeto_id = str(row["id"])
 
         # Vincular projeto existente à pesquisa atual
         if projeto_id:
             await conn.execute(
-                "UPDATE projetos SET pesquisa_id_atual = $1, updated_at = NOW() WHERE id = $2",
+                "UPDATE projetos SET pesquisa_id_atual = $1, updated_at = NOW() WHERE id = $2::uuid",
                 pesquisa_id, projeto_id,
             )
 
-        # Atualizar pesquisa — status 'aprovado' é o valor válido no check constraint
-        await conn.execute(
-            """UPDATE pesquisas
-               SET status = 'aprovado', reviewed_at = NOW(), projeto_id = $2
-               WHERE id = $1""",
-            pesquisa_id, projeto_id,
-        )
+        async with conn.transaction():
+            # Atualizar pesquisa — status 'aprovado' é o valor válido no check constraint.
+            # O vínculo com o projeto só é reescrito quando um projeto foi informado:
+            # a versão anterior fazia `SET projeto_id = $2` incondicionalmente e, com
+            # body vazio (o caso do dashboard), ZERAVA o vínculo INT legado da pesquisa.
+            if projeto_id:
+                projeto_id_int = await conn.fetchval(
+                    "SELECT id_int_legado FROM projetos WHERE id = $1::uuid", projeto_id
+                )
+                await conn.execute(
+                    """UPDATE pesquisas
+                       SET status = 'aprovado', reviewed_at = NOW(),
+                           projeto_id_uuid = $2::uuid, projeto_id = $3::int
+                       WHERE id = $1""",
+                    pesquisa_id, projeto_id, projeto_id_int,
+                )
+            else:
+                await conn.execute(
+                    """UPDATE pesquisas
+                       SET status = 'aprovado', reviewed_at = NOW()
+                       WHERE id = $1""",
+                    pesquisa_id,
+                )
+
+            # Gate de verdade: as keywords não-DESCARTA saem de 'pending'.
+            result = await conn.execute(
+                """UPDATE kw_staging
+                      SET status = 'approved', updated_at = NOW()
+                    WHERE pesquisa_id = $1::uuid
+                      AND status = 'pending'
+                      AND UPPER(COALESCE(kw_type, '')) <> 'DESCARTA'""",
+                pesquisa_id,
+            )
+            keywords_aprovadas = int(result.split()[-1])
 
     # Gravar keywords aprovadas em BQ leadgen_silver.kw_plan (espelho — Postgres é fonte de verdade)
     bq = _get_bq_client()
@@ -410,6 +461,7 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
         "pesquisa_id": pesquisa_id,
         "status": "aprovado",
         "projeto_id": projeto_id,
+        "keywords_aprovadas": keywords_aprovadas,
     }
 
 

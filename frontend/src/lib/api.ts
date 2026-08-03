@@ -650,3 +650,76 @@ export const contentApi = {
   delete: (projetoId: string, pageSlug: string) =>
     api.delete(`/projetos/${projetoId}/content/${pageSlug}`),
 }
+
+// ── Plano de Keywords (Gate do Board) ─────────────────────────────
+export type KwStatus = 'pending' | 'approved' | 'rejected'
+
+export interface ProjetoKeyword {
+  id: number
+  keyword: string
+  kw_type: string | null
+  status: KwStatus
+  avg_monthly_searches: number | null
+  competition: string | null
+  competition_index: number | null
+  bid_pos5_8_brl: number | null
+  bid_pos1_4_brl: number | null
+  score: number | null
+  go_nogo: string | null
+  competitive_score: number | null
+  difficulty_label: string | null
+  board_note: string | null
+  pesquisa_id: string
+  papel: string | null
+  nicho: string
+  pesquisa_status: string
+}
+
+export interface ProjetoKeywordsPage {
+  total: number
+  items: ProjetoKeyword[]
+  resumo: {
+    por_status: Record<string, number>
+    por_kw_type: Record<string, number>
+  }
+}
+
+export interface ApprovePlanPayload {
+  reclassify?: { keyword_id: number; kw_type: string }[]
+  approve_ids?: number[]
+  reject_ids?: number[]
+  approve_all_non_descarta?: boolean
+  aprovar_pesquisas?: boolean
+}
+
+export interface ApprovePlanResult {
+  approved: number
+  rejected: number
+  reclassified: number
+  skipped_descarta: number
+  pending_restantes: number
+  pesquisas_atualizadas: string[]
+  not_found: number[]
+  invalid: { id: number; reason: string }[]
+}
+
+export interface ProjetoKeywordsFilters {
+  status?: string
+  kw_type?: string
+  pesquisa_id?: string
+  papel?: string
+  q?: string
+  limit?: number
+  offset?: number
+}
+
+export const projetoKeywordsApi = {
+  list: (projetoId: string, filters: ProjetoKeywordsFilters = {}) =>
+    api
+      .get<ProjetoKeywordsPage>(`/projetos/${projetoId}/keywords`, { params: filters })
+      .then(r => r.data),
+  approvePlan: (projetoId: string, payload: ApprovePlanPayload) =>
+    api
+      .post<ApprovePlanResult>(`/projetos/${projetoId}/keywords/approve`, payload)
+      .then(r => r.data),
+}

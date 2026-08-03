@@ -796,6 +796,12 @@ export function ProjetoDetail() {
                   available={true}
                 />
                 <DocBtn
+                  label="Plano de Keywords (Gate)"
+                  path={`/projetos/${projeto.id}/keywords`}
+                  colorCls="bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                  available={true}
+                />
+                <DocBtn
                   label="Plano de SEO"
                   path={`/projetos/${projeto.id}/seo-plan`}
                   colorCls="bg-blue-500/10 text-blue-400 border-blue-500/30"
