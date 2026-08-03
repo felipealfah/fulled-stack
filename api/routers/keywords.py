@@ -109,11 +109,13 @@ async def list_projeto_keywords(
             n += 1
 
         if kw_type:
+            # Case-insensitive dos dois lados: projetos legacy gravaram kw_type
+            # em lowercase ('principal', 'geo'…) antes da normalização.
             if kw_type.startswith("!"):
                 where.append(f"UPPER(COALESCE(ks.kw_type, '')) <> UPPER(${n})")
                 params.append(kw_type[1:])
             else:
-                where.append(f"ks.kw_type = ${n}")
+                where.append(f"UPPER(COALESCE(ks.kw_type, '')) = UPPER(${n})")
                 params.append(kw_type)
             n += 1
 
