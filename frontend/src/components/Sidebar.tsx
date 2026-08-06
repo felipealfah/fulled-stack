@@ -143,6 +143,24 @@ export function Sidebar() {
           Financeiro
         </NavLink>
 
+        {/* ── Seção LowTicket ───────────────────────────── */}
+        <div className="border-t border-gray-800/60 my-1.5" />
+        <span className="px-3 py-1 text-[10px] font-mono text-gray-700 uppercase tracking-wider select-none">
+          LowTicket
+        </span>
+        <NavLink
+          to="/lowticket"
+          className={({ isActive }) =>
+            `flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-mono transition-colors ${
+              isActive
+                ? 'text-violet-400 bg-violet-500/10'
+                : 'text-gray-400 hover:text-gray-100 hover:bg-gray-800'
+            }`
+          }
+        >
+          Tracker de Ofertas
+        </NavLink>
+
         <LogoutButton />
       </nav>
     </aside>

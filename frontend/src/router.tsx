@@ -16,6 +16,7 @@ import { ContentReview } from './pages/ContentReview'
 import { CompetitorAudit } from './pages/CompetitorAudit'
 import { Prospeccao } from './pages/Prospeccao'
 import { Financeiro } from './pages/Financeiro'
+import { LowTicket } from './pages/LowTicket'
 
 export function AppRouter() {
   return (
@@ -40,6 +41,7 @@ export function AppRouter() {
         <Route path="/sites" element={<Sites />} />
         <Route path="/prospeccao" element={<Prospeccao />} />
         <Route path="/financeiro" element={<Financeiro />} />
+        <Route path="/lowticket" element={<LowTicket />} />
       </Route>
       </Route>
     </Routes>
