@@ -991,6 +991,408 @@ function TrackerTab() {
   )
 }
 
+// ── Aba Candidatas (FR-5) ─────────────────────────────────────────────────────
+
+function CandidatasTab() {
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+
+  const { data: candidatas, isLoading, error } = useQuery({
+    queryKey: ['lt-candidatas'],
+    queryFn: fetchCandidatas,
+    staleTime: 30_000,
+  })
+
+  const { data: trackerRows } = useQuery({
+    queryKey: ['lt-candidatas-tracker'],
+    queryFn: fetchCandidatasTracker,
+    staleTime: 30_000,
+    enabled: (candidatas?.length ?? 0) > 0,
+  })
+
+  const candidataIds = useMemo(
+    () => (candidatas ?? []).map(c => c.id),
+    [candidatas]
+  )
+
+  const { data: sparklines } = useQuery({
+    queryKey: ['lt-sparklines-cand', candidataIds],
+    queryFn: () => fetchSparklines(candidataIds),
+    staleTime: 60_000,
+    enabled: candidataIds.length > 0,
+  })
+
+  // Join em memória: TrackerRow por id para acessar delta_7d e tendencia
+  const trackerById = useMemo(() => {
+    const map: Record<string, NonNullable<typeof trackerRows>[number]> = {}
+    for (const row of trackerRows ?? []) {
+      map[row.id] = row
+    }
+    return map
+  }, [trackerRows])
+
+  function handleCopiarBriefing(oferta: Oferta) {
+    const md = [
+      `## Briefing — ${oferta.anunciante ?? '(sem nome)'}`,
+      ``,
+      `- **page_id:** ${oferta.page_id ?? '—'}`,
+      `- **Link:** ${oferta.link_ad_library ?? '—'}`,
+      `- **Nicho:** ${oferta.nicho ?? '—'}`,
+      `- **Funil:** ${oferta.tipo_funil ?? '—'}`,
+      `- **Formato:** ${oferta.formato_entregavel ?? '—'}`,
+      `- **N. anúncios ativos:** ${oferta.n_anuncios_ativos ?? '—'}`,
+      `- **Dias ativo:** ${oferta.dias_ativo_oferta ?? '—'}`,
+      `- **Observações:** ${oferta.observacoes ?? '—'}`,
+    ].join('\n')
+
+    navigator.clipboard.writeText(md).then(() => {
+      setCopiedId(oferta.id)
+      setTimeout(() => setCopiedId(null), 2000)
+    })
+  }
+
+  if (isLoading) {
+    return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando...</p>
+  }
+  if (error) {
+    return <p className="text-red-400 text-sm font-mono py-12 text-center">Erro ao carregar.</p>
+  }
+  if (!candidatas || candidatas.length === 0) {
+    return <p className="text-gray-600 font-mono text-sm py-8 text-center">Nenhuma candidata ainda.</p>
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="overflow-x-auto rounded-xl border border-gray-800">
+        <table className="w-full text-sm font-mono">
+          <thead>
+            <tr className="border-b border-gray-800 bg-gray-900/60">
+              <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Expert</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Δ7d</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Spark</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Observações</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Briefing</th>
+            </tr>
+          </thead>
+          <tbody>
+            {candidatas.map((o: Oferta) => {
+              const tracker = trackerById[o.id]
+              const delta = tracker?.delta_7d ?? null
+              const pontos = sparklines?.[o.id] ?? []
+
+              const deltaEl = delta === null ? (
+                <span className="text-gray-600">—</span>
+              ) : delta > 0 ? (
+                <span className="text-emerald-400">+{delta}</span>
+              ) : delta < 0 ? (
+                <span className="text-red-400">{delta}</span>
+              ) : (
+                <span className="text-gray-500">0</span>
+              )
+
+              return (
+                <tr key={o.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
+                  <td className="px-4 py-3 max-w-[160px]">
+                    <span className="flex items-center gap-1.5">
+                      {o.vertical_risco && <span className="text-red-400 shrink-0" title="Vertical de risco">⚠️</span>}
+                      <span className="truncate text-gray-200">{o.anunciante ?? '—'}</span>
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-gray-400 max-w-[120px]">
+                    <span className="truncate block">{o.nicho ?? '—'}</span>
+                  </td>
+                  <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.tipo_funil ?? '—'}</td>
+                  <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                    {o.oportunidade_infoapp && <span className="text-amber-400 mr-1">⭐</span>}
+                    {o.formato_entregavel ?? '—'}
+                  </td>
+                  <td className="px-3 py-3 text-gray-400">{o.expert ? 'Sim' : '—'}</td>
+                  <td className="px-3 py-3 text-gray-300">{o.n_anuncios_ativos ?? '—'}</td>
+                  <td className="px-3 py-3 text-gray-400">{o.dias_ativo_oferta ?? '—'}</td>
+                  <td className="px-3 py-3 text-xs">{deltaEl}</td>
+                  <td className="px-3 py-3">
+                    <SparklineSVG points={pontos} />
+                  </td>
+                  <td className="px-3 py-3 text-gray-500 text-xs max-w-[160px]">
+                    <span className="truncate block" title={o.observacoes ?? ''}>
+                      {o.observacoes
+                        ? o.observacoes.slice(0, 40) + (o.observacoes.length > 40 ? '…' : '')
+                        : '—'}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3">
+                    {o.link_ad_library ? (
+                      <a
+                        href={o.link_ad_library}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs font-mono text-violet-400 hover:text-violet-300 border border-violet-500/30 px-2 py-1 rounded transition-colors whitespace-nowrap"
+                      >
+                        Biblioteca
+                      </a>
+                    ) : (
+                      <span className="text-gray-700 text-xs">—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-3">
+                    {copiedId === o.id ? (
+                      <span className="text-emerald-400 text-xs font-mono">Copiado!</span>
+                    ) : (
+                      <button
+                        onClick={() => handleCopiarBriefing(o)}
+                        className="text-xs font-mono text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-600 px-2 py-1 rounded transition-colors whitespace-nowrap"
+                      >
+                        Copiar
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs font-mono text-gray-700">
+        {candidatas.length} candidata{candidatas.length !== 1 ? 's' : ''}
+      </p>
+    </div>
+  )
+}
+
+// ── Aba Infoapp (FR-6) ────────────────────────────────────────────────────────
+
+function InfoappTab() {
+  const { data: ofertas, isLoading, error } = useQuery({
+    queryKey: ['lt-infoapp'],
+    queryFn: fetchInfoapp,
+    staleTime: 30_000,
+  })
+
+  if (isLoading) {
+    return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando...</p>
+  }
+  if (error) {
+    return <p className="text-red-400 text-sm font-mono py-12 text-center">Erro ao carregar.</p>
+  }
+  if (!ofertas || ofertas.length === 0) {
+    return <p className="text-gray-600 font-mono text-sm py-8 text-center">Nenhuma oferta infoapp no momento.</p>
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="overflow-x-auto rounded-xl border border-gray-800">
+        <table className="w-full text-sm font-mono">
+          <thead>
+            <tr className="border-b border-gray-800 bg-gray-900/60">
+              <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
+              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ofertas.map((o: Oferta) => (
+              <tr key={o.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
+                <td className="px-4 py-3 max-w-[160px]">
+                  <span className="flex items-center gap-1.5">
+                    {o.vertical_risco && <span className="text-red-400 shrink-0" title="Vertical de risco">⚠️</span>}
+                    <span className="truncate text-gray-200">{o.anunciante ?? '—'}</span>
+                  </span>
+                </td>
+                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                  {fmtMix(o.n_criativos_video, o.n_criativos_imagem)}
+                </td>
+                <td className="px-3 py-3 text-gray-300">{o.n_anuncios_ativos ?? '—'}</td>
+                <td className="px-3 py-3 text-gray-400">{o.dias_ativo_oferta ?? '—'}</td>
+                <td className="px-3 py-3 text-gray-400 max-w-[120px]">
+                  <span className="truncate block">{o.nicho ?? '—'}</span>
+                </td>
+                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.mercado ?? '—'}</td>
+                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.preco_visivel ?? '—'}</td>
+                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                  <span className="text-amber-400 mr-1">⭐</span>
+                  {o.formato_entregavel ?? '—'}
+                </td>
+                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.tipo_funil ?? '—'}</td>
+                <td className="px-3 py-3">
+                  <StatusChip status={o.status} />
+                </td>
+                <td className="px-3 py-3 text-gray-600 text-xs whitespace-nowrap">
+                  {fmtDate(o.atualizado_em)}
+                </td>
+                <td className="px-3 py-3">
+                  {o.link_ad_library ? (
+                    <a
+                      href={o.link_ad_library}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs font-mono text-violet-400 hover:text-violet-300 border border-violet-500/30 px-2 py-1 rounded transition-colors whitespace-nowrap"
+                    >
+                      Biblioteca
+                    </a>
+                  ) : (
+                    <span className="text-gray-700 text-xs">—</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs font-mono text-gray-700">
+        {ofertas.length} oferta{ofertas.length !== 1 ? 's' : ''} infoapp
+      </p>
+    </div>
+  )
+}
+
+// ── Aba Arquivo (FR-7) ────────────────────────────────────────────────────────
+
+const ARQUIVO_STATUS_OPTS: Array<{ value: OfertaStatus | ''; label: string }> = [
+  { value: '', label: 'Todos' },
+  { value: 'descartada', label: 'Descartada' },
+  { value: 'saturada', label: 'Saturada' },
+  { value: 'pausada', label: 'Pausada' },
+]
+
+function ArquivoTab() {
+  const [arquivoBusca, setArquivoBusca] = useState('')
+  const [arquivoBuscaDebounced, setArquivoBuscaDebounced] = useState('')
+  const [arquivoStatus, setArquivoStatus] = useState<OfertaStatus | ''>('')
+
+  // Debounce 300ms para não disparar query a cada tecla
+  useEffect(() => {
+    const t = setTimeout(() => setArquivoBuscaDebounced(arquivoBusca), 300)
+    return () => clearTimeout(t)
+  }, [arquivoBusca])
+
+  const { data: ofertas, isLoading, error } = useQuery({
+    queryKey: ['lt-arquivo', arquivoStatus, arquivoBuscaDebounced],
+    queryFn: () => fetchArquivo({
+      status: arquivoStatus || undefined,
+      busca: arquivoBuscaDebounced || undefined,
+    }),
+    staleTime: 30_000,
+  })
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Header: busca + filtros de status */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <input
+          type="text"
+          placeholder="Buscar anunciante..."
+          value={arquivoBusca}
+          onChange={e => setArquivoBusca(e.target.value)}
+          className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-100 focus:outline-none focus:border-violet-500 w-56"
+        />
+        <div className="flex items-center gap-2 flex-wrap">
+          {ARQUIVO_STATUS_OPTS.map(opt => (
+            <button
+              key={opt.value}
+              onClick={() => setArquivoStatus(opt.value)}
+              className={`text-xs font-mono px-3 py-1 rounded-full border transition-colors ${
+                arquivoStatus === opt.value
+                  ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
+                  : 'border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Tabela — somente leitura */}
+      {isLoading ? (
+        <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando...</p>
+      ) : error ? (
+        <p className="text-red-400 text-sm font-mono py-12 text-center">Erro ao carregar.</p>
+      ) : !ofertas || ofertas.length === 0 ? (
+        <p className="text-gray-600 font-mono text-sm py-8 text-center">Nenhuma oferta no arquivo.</p>
+      ) : (
+        <>
+          <div className="overflow-x-auto rounded-xl border border-gray-800">
+            <table className="w-full text-sm font-mono">
+              <thead>
+                <tr className="border-b border-gray-800 bg-gray-900/60">
+                  <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
+                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ofertas.map((o: Oferta) => (
+                  <tr key={o.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
+                    <td className="px-4 py-3 max-w-[160px]">
+                      <span className="truncate block text-gray-300">{o.anunciante ?? '—'}</span>
+                    </td>
+                    <td className="px-3 py-3 text-gray-400 max-w-[120px]">
+                      <span className="truncate block">{o.nicho ?? '—'}</span>
+                    </td>
+                    <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.tipo_funil ?? '—'}</td>
+                    <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                      {o.oportunidade_infoapp && <span className="text-amber-400 mr-1">⭐</span>}
+                      {o.formato_entregavel ?? '—'}
+                    </td>
+                    <td className="px-3 py-3 text-gray-400">{o.n_anuncios_ativos ?? '—'}</td>
+                    <td className="px-3 py-3 text-gray-400">{o.dias_ativo_oferta ?? '—'}</td>
+                    <td className="px-3 py-3">
+                      <StatusChip status={o.status} />
+                    </td>
+                    <td className="px-3 py-3 text-gray-600 text-xs whitespace-nowrap">
+                      {fmtDate(o.atualizado_em)}
+                    </td>
+                    <td className="px-3 py-3">
+                      {o.link_ad_library ? (
+                        <a
+                          href={o.link_ad_library}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs font-mono text-violet-400 hover:text-violet-300 border border-violet-500/30 px-2 py-1 rounded transition-colors whitespace-nowrap"
+                        >
+                          Biblioteca
+                        </a>
+                      ) : (
+                        <span className="text-gray-700 text-xs">—</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs font-mono text-gray-700">
+            {ofertas.length} oferta{ofertas.length !== 1 ? 's' : ''} no arquivo
+            {arquivoStatus ? ` · ${arquivoStatus}` : ''}
+            {arquivoBuscaDebounced ? ` · busca: "${arquivoBuscaDebounced}"` : ''}
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
 // ── Placeholder para abas futuras ─────────────────────────────────────────────
 
 function EmBreve() {
@@ -1121,9 +1523,9 @@ export function LowTicket() {
         {/* Aba ativa */}
         {aba === 'gate'       && <GateTab />}
         {aba === 'tracker'    && <TrackerTab />}
-        {aba === 'candidatas' && <EmBreve />}
-        {aba === 'infoapp'    && <EmBreve />}
-        {aba === 'arquivo'    && <EmBreve />}
+        {aba === 'candidatas' && <CandidatasTab />}
+        {aba === 'infoapp'    && <InfoappTab />}
+        {aba === 'arquivo'    && <ArquivoTab />}
         {aba === 'rastros'    && <EmBreve />}
       </main>
     </div>
