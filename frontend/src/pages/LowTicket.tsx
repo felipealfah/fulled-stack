@@ -5,12 +5,19 @@ import {
   fetchGate,
   fetchAtualizadoEm,
   fetchOfertaByPageId,
+  fetchTracker,
+  fetchSparklines,
+  fetchCandidatas,
+  fetchCandidatasTracker,
+  fetchInfoapp,
+  fetchArquivo,
   updateOferta,
   insertOferta,
   type Oferta,
   type OfertaStatus,
   type TipoFunil,
   type FormatoEntregavel,
+  type ObservacaoDiaria,
 } from '../lib/lowticket'
 
 // ── Status config ─────────────────────────────────────────────────────────────
@@ -806,6 +813,184 @@ function GateTab() {
   )
 }
 
+// ── Sparkline SVG inline ──────────────────────────────────────────────────────
+
+function SparklineSVG({ points }: { points: ObservacaoDiaria[] }) {
+  if (!points || points.length < 2) return <span className="text-gray-700 text-xs">—</span>
+  const vals = points.map(p => p.n_ads_ativos)
+  const min = Math.min(...vals)
+  const max = Math.max(...vals)
+  const W = 80, H = 28, PAD = 2
+  const normalize = (v: number) =>
+    max === min ? H / 2 : PAD + (H - 2 * PAD) * (1 - (v - min) / (max - min))
+  const step = (W - 2 * PAD) / (vals.length - 1)
+  const d = vals
+    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(PAD + i * step).toFixed(1)},${normalize(v).toFixed(1)}`)
+    .join(' ')
+  return (
+    <svg width={W} height={H} className="overflow-visible">
+      <path d={d} fill="none" stroke="#34d399" strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+// ── Aba Tracker ───────────────────────────────────────────────────────────────
+
+function TrackerTab() {
+  const queryClient = useQueryClient()
+
+  const { data: trackerRows, isLoading: loadingTracker, error: errorTracker } = useQuery({
+    queryKey: ['lt-tracker'],
+    queryFn: fetchTracker,
+    staleTime: 30_000,
+  })
+
+  const trackerIds = useMemo(() => (trackerRows ?? []).map(r => r.id), [trackerRows])
+
+  const { data: sparklines } = useQuery({
+    queryKey: ['lt-sparklines', trackerIds],
+    queryFn: () => fetchSparklines(trackerIds),
+    enabled: trackerIds.length > 0,
+  })
+
+  const overrideMutation = useMutation({
+    mutationFn: ({ id, status }: { id: string; status: OfertaStatus }) =>
+      updateOferta(id, { status }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+    },
+  })
+
+  function handleOverrideStatus(id: string, status: OfertaStatus) {
+    overrideMutation.mutate({ id, status })
+  }
+
+  if (loadingTracker) {
+    return <p className="text-gray-600 font-mono text-sm py-8 text-center">Carregando tracker...</p>
+  }
+  if (errorTracker) {
+    return <p className="text-red-400 font-mono text-sm py-8 text-center">Erro ao carregar tracker.</p>
+  }
+  if (!trackerRows || trackerRows.length === 0) {
+    return <p className="text-gray-600 font-mono text-sm py-8 text-center">Nenhuma oferta em monitoramento.</p>
+  }
+
+  function renderDelta7d(val: number | null) {
+    if (val === null) return <span className="text-gray-600">—</span>
+    if (val > 0) return <span className="text-emerald-400 font-mono">+{val}</span>
+    if (val < 0) return <span className="text-red-400 font-mono">{val}</span>
+    return <span className="text-gray-500 font-mono">0</span>
+  }
+
+  function renderTendencia(val: 'subindo' | 'caindo' | 'estavel' | null) {
+    if (val === 'subindo') return '🚀'
+    if (val === 'caindo') return '📉'
+    if (val === 'estavel') return '➡️'
+    return '—'
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-xl border border-gray-800">
+      <table className="w-full text-xs font-mono">
+        <thead>
+          <tr className="border-b border-gray-800 bg-gray-900/60">
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Anunciante</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Nicho</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Funil</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Expert</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Início</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Status</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Dia 1</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Dia atual</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Δ7d</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Máx</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Mín</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Tendência</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Sparkline</th>
+            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Lib</th>
+          </tr>
+        </thead>
+        <tbody>
+          {trackerRows.map(row => (
+            <tr key={row.id} className="border-b border-gray-800/40 hover:bg-gray-900/60">
+              <td className="px-3 py-2.5 text-gray-300 max-w-[140px]">
+                <span className="truncate block">{row.anunciante ?? '—'}</span>
+              </td>
+              <td className="px-3 py-2.5 text-gray-300 max-w-[120px]">
+                <span className="truncate block">{row.nicho ?? '—'}</span>
+              </td>
+              <td className="px-3 py-2.5 text-gray-300 whitespace-nowrap">
+                {row.tipo_funil ?? '—'}
+              </td>
+              <td className="px-3 py-2.5 whitespace-nowrap">
+                {row.expert
+                  ? <span className="text-emerald-400">✓</span>
+                  : <span className="text-gray-600">—</span>}
+              </td>
+              <td className="px-3 py-2.5 text-gray-400 whitespace-nowrap">
+                {row.data_inicio_monitoramento
+                  ? new Date(row.data_inicio_monitoramento).toLocaleDateString('pt-BR')
+                  : '—'}
+              </td>
+              <td className="px-3 py-2.5">
+                <select
+                  value={row.status}
+                  onChange={e => handleOverrideStatus(row.id, e.target.value as OfertaStatus)}
+                  className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs font-mono text-gray-300"
+                >
+                  <option value="monitorando">monitorando</option>
+                  <option value="em_escala">em_escala</option>
+                  <option value="saturada">saturada</option>
+                  <option value="pausada">pausada</option>
+                </select>
+              </td>
+              <td className="px-3 py-2.5 text-gray-400">
+                {row.dia_1 ?? '—'}
+              </td>
+              <td className="px-3 py-2.5 text-gray-400">
+                {row.dia_atual ?? '—'}
+              </td>
+              <td className="px-3 py-2.5">
+                {renderDelta7d(row.delta_7d)}
+              </td>
+              <td className="px-3 py-2.5 text-gray-400">
+                {row.maximo ?? '—'}
+              </td>
+              <td className="px-3 py-2.5 text-gray-400">
+                {row.minimo ?? '—'}
+              </td>
+              <td className="px-3 py-2.5 text-gray-300 text-base">
+                {renderTendencia(row.tendencia)}
+              </td>
+              <td className="px-3 py-2.5">
+                <SparklineSVG points={sparklines?.[row.id] ?? []} />
+              </td>
+              <td className="px-3 py-2.5">
+                {row.link_ad_library ? (
+                  <a
+                    href={row.link_ad_library}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs font-mono text-violet-400 hover:text-violet-300 border border-violet-500/30 px-2 py-1 rounded transition-colors whitespace-nowrap"
+                  >
+                    Biblioteca
+                  </a>
+                ) : (
+                  <span className="text-gray-700 text-xs">—</span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="text-xs font-mono text-gray-700 px-3 py-2">
+        {trackerRows.length} oferta{trackerRows.length !== 1 ? 's' : ''} em monitoramento
+      </p>
+    </div>
+  )
+}
+
 // ── Placeholder para abas futuras ─────────────────────────────────────────────
 
 function EmBreve() {
@@ -935,7 +1120,7 @@ export function LowTicket() {
 
         {/* Aba ativa */}
         {aba === 'gate'       && <GateTab />}
-        {aba === 'tracker'    && <EmBreve />}
+        {aba === 'tracker'    && <TrackerTab />}
         {aba === 'candidatas' && <EmBreve />}
         {aba === 'infoapp'    && <EmBreve />}
         {aba === 'arquivo'    && <EmBreve />}
