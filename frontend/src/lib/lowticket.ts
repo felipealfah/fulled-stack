@@ -237,3 +237,121 @@ export async function fetchOfertaByPageId(pageId: string): Promise<Oferta | null
   if (error) throw error
   return data as Oferta | null
 }
+
+/**
+ * Retorna ofertas em monitoramento via v_tracker.
+ * Filtra status IN ('monitorando','em_escala','saturada','pausada'), ordenado por data_inicio_monitoramento DESC.
+ */
+export async function fetchTracker(): Promise<TrackerRow[]> {
+  const { data, error } = await supabaseLT
+    .from('v_tracker')
+    .select('*')
+    .in('status', ['monitorando', 'em_escala', 'saturada', 'pausada'])
+    .order('data_inicio_monitoramento', { ascending: false })
+
+  if (error) throw error
+  return (data ?? []) as TrackerRow[]
+}
+
+/**
+ * Retorna candidatas (status = 'candidata') ordenadas por atualizado_em DESC.
+ */
+export async function fetchCandidatas(): Promise<Oferta[]> {
+  const { data, error } = await supabaseLT
+    .from('ofertas')
+    .select('*')
+    .eq('status', 'candidata')
+    .order('atualizado_em', { ascending: false })
+
+  if (error) throw error
+  return (data ?? []) as Oferta[]
+}
+
+/**
+ * Retorna rows do v_tracker com status = 'candidata' para join de delta_7d.
+ */
+export async function fetchCandidatasTracker(): Promise<TrackerRow[]> {
+  const { data, error } = await supabaseLT
+    .from('v_tracker')
+    .select('*')
+    .eq('status', 'candidata')
+    .order('data_inicio_monitoramento', { ascending: false })
+
+  if (error) throw error
+  return (data ?? []) as TrackerRow[]
+}
+
+/**
+ * Retorna ofertas com oportunidade_infoapp=true exceto descartadas,
+ * ordenadas por atualizado_em DESC.
+ */
+export async function fetchInfoapp(): Promise<Oferta[]> {
+  const { data, error } = await supabaseLT
+    .from('ofertas')
+    .select('*')
+    .eq('oportunidade_infoapp', true)
+    .neq('status', 'descartada')
+    .order('atualizado_em', { ascending: false })
+
+  if (error) throw error
+  return (data ?? []) as Oferta[]
+}
+
+/**
+ * Retorna ofertas arquivadas: status IN (descartada, saturada, pausada).
+ * Filtros opcionais: status específico e busca por anunciante (ILIKE).
+ * Limite de 200 registros por padrão (T-34-08).
+ */
+export async function fetchArquivo(params?: {
+  status?: OfertaStatus
+  busca?: string
+}): Promise<Oferta[]> {
+  let query = supabaseLT
+    .from('ofertas')
+    .select('*')
+    .in('status', ['descartada', 'saturada', 'pausada'])
+
+  if (params?.status) {
+    query = query.eq('status', params.status)
+  }
+
+  if (params?.busca && params.busca.trim() !== '') {
+    query = query.ilike('anunciante', `%${params.busca}%`)
+  }
+
+  const { data, error } = await query
+    .order('atualizado_em', { ascending: false })
+    .limit(200) // mitigação T-34-08
+
+  if (error) throw error
+  return (data ?? []) as Oferta[]
+}
+
+/**
+ * Retorna observacoes_diarias agrupadas por oferta_id.
+ * Limita a 200 IDs para evitar URLs longas no PostgREST (T-34-06).
+ */
+export async function fetchSparklines(
+  ofertaIds: string[]
+): Promise<Record<string, ObservacaoDiaria[]>> {
+  if (ofertaIds.length === 0) return {}
+
+  // Mitigação T-34-06: limite de 200 IDs
+  const ids = ofertaIds.slice(0, 200)
+
+  const { data, error } = await supabaseLT
+    .from('observacoes_diarias')
+    .select('oferta_id, data, dia_monitoramento, n_ads_ativos')
+    .in('oferta_id', ids)
+    .order('dia_monitoramento', { ascending: true })
+
+  if (error) throw error
+
+  const result: Record<string, ObservacaoDiaria[]> = {}
+  for (const row of data ?? []) {
+    const r = row as ObservacaoDiaria
+    if (!result[r.oferta_id]) result[r.oferta_id] = []
+    result[r.oferta_id].push(r)
+  }
+  return result
+}
