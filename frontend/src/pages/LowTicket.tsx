@@ -11,6 +11,9 @@ import {
   fetchCandidatasTracker,
   fetchInfoapp,
   fetchArquivo,
+  fetchRastros,
+  insertRastro,
+  updateRastro,
   updateOferta,
   insertOferta,
   type Oferta,
@@ -18,6 +21,9 @@ import {
   type TipoFunil,
   type FormatoEntregavel,
   type ObservacaoDiaria,
+  type Rastro,
+  type RastroGrupo,
+  type RastroStatus,
 } from '../lib/lowticket'
 
 // ── Status config ─────────────────────────────────────────────────────────────
@@ -1401,6 +1407,421 @@ function EmBreve() {
   )
 }
 
+// ── Aba Rastros (FR-10) ───────────────────────────────────────────────────────
+
+const RASTRO_GRUPO_OPTS: RastroGrupo[] = ['builder', 'checkout', 'resposta_direta', 'nicho']
+const RASTRO_TIPO_BUSCA_OPTS: Array<'plataforma' | 'nicho'> = ['plataforma', 'nicho']
+
+const RASTRO_STATUS_CFG: Record<RastroStatus, { label: string; cls: string }> = {
+  a_testar:    { label: 'a_testar',    cls: 'bg-amber-500/20 text-amber-400 border border-amber-500/40' },
+  testado:     { label: 'testado',     cls: 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40' },
+  sem_retorno: { label: 'sem_retorno', cls: 'bg-gray-700/20 text-gray-500 border border-gray-700/30' },
+}
+
+// Estado local de edição por linha
+interface RastroEditState {
+  grupo: RastroGrupo
+  tipo_busca: 'plataforma' | 'nicho'
+  funil_hint: string
+  populacao_observada: string // string para input controlado, converte para number no save
+}
+
+function RastrosTab() {
+  const queryClient = useQueryClient()
+
+  // Form de inserção
+  const [showForm, setShowForm] = useState(false)
+  const [formQuery, setFormQuery] = useState('')
+  const [formGrupo, setFormGrupo] = useState<RastroGrupo | ''>('')
+  const [formTipoBusca, setFormTipoBusca] = useState<'plataforma' | 'nicho'>('plataforma')
+  const [formFunilHint, setFormFunilHint] = useState('')
+  const [formErr, setFormErr] = useState<string | null>(null)
+
+  // Estado de edição inline por linha (rastroId → estado editado)
+  const [editState, setEditState] = useState<Record<string, RastroEditState>>({})
+
+  // Query principal
+  const { data: rastros, isLoading: loadingRastros, error: errorRastros } = useQuery({
+    queryKey: ['lt-rastros'],
+    queryFn: fetchRastros,
+    enabled: true,
+  })
+
+  // Inicializa o editState quando rastros carregam (sem sobrescrever edições ativas)
+  useEffect(() => {
+    if (!rastros) return
+    setEditState(prev => {
+      const next: Record<string, RastroEditState> = { ...prev }
+      for (const r of rastros) {
+        if (!(r.id in next)) {
+          next[r.id] = {
+            grupo: r.grupo,
+            tipo_busca: r.tipo_busca,
+            funil_hint: r.funil_hint ?? '',
+            populacao_observada: r.populacao_observada != null ? String(r.populacao_observada) : '',
+          }
+        }
+      }
+      return next
+    })
+  }, [rastros])
+
+  // Mutation: atualizar rastro
+  const rastroMutation = useMutation({
+    mutationFn: ({ id, patch }: { id: string; patch: Parameters<typeof updateRastro>[1] }) =>
+      updateRastro(id, patch),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['lt-rastros'] }),
+  })
+
+  function handleUpdateRastro(id: string, patch: Parameters<typeof updateRastro>[1]) {
+    rastroMutation.mutate({ id, patch })
+  }
+
+  // Mutation: inserir rastro
+  const insertMutation = useMutation({
+    mutationFn: insertRastro,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-rastros'] })
+      setShowForm(false)
+      setFormQuery('')
+      setFormGrupo('')
+      setFormFunilHint('')
+      setFormTipoBusca('plataforma')
+      setFormErr(null)
+    },
+    onError: (e: Error) => setFormErr(e.message),
+  })
+
+  function handleSubmitForm(ev: React.FormEvent) {
+    ev.preventDefault()
+    setFormErr(null)
+    if (!formQuery.trim()) {
+      setFormErr('Query é obrigatória.')
+      return
+    }
+    if (!formGrupo) {
+      setFormErr('Grupo é obrigatório.')
+      return
+    }
+    insertMutation.mutate({
+      query: formQuery.trim(),
+      grupo: formGrupo,
+      tipo_busca: formTipoBusca,
+      funil_hint: formFunilHint.trim() || null,
+    })
+  }
+
+  // Verificar se há rastros de nicho (aviso global)
+  const temNicho = (rastros ?? []).some(r => r.tipo_busca === 'nicho')
+
+  const labelCls = 'text-xs font-mono text-gray-500 mb-1 block'
+  const inputCls = 'w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-100 focus:outline-none focus:border-violet-500'
+  const inlineInputCls = 'bg-transparent border-b border-gray-700 text-xs font-mono text-gray-300 focus:border-violet-500 outline-none w-full'
+  const inlineSelectCls = 'bg-gray-900 border border-gray-700 rounded px-1 py-0.5 text-xs font-mono text-gray-300 focus:border-violet-500 outline-none'
+
+  if (loadingRastros) {
+    return <p className="text-gray-600 font-mono text-sm py-8 text-center">Carregando rastros...</p>
+  }
+  if (errorRastros) {
+    return <p className="text-red-400 font-mono text-sm py-8 text-center">Erro ao carregar rastros.</p>
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h2 className="text-sm font-mono font-semibold text-gray-100">Catálogo de Rastros</h2>
+          {temNicho && (
+            <p className="text-xs font-mono text-amber-500/80 mt-1">
+              Rastros de nicho (⚠ não rodam no ciclo de plataforma atual) estão marcados na tabela.
+            </p>
+          )}
+        </div>
+        <button
+          onClick={() => setShowForm(true)}
+          className="text-xs font-mono px-3 py-1.5 rounded-lg border border-violet-500/40 text-violet-400 hover:bg-violet-500/10 transition-colors whitespace-nowrap"
+        >
+          + Novo Rastro
+        </button>
+      </div>
+
+      {/* Modal: Novo Rastro */}
+      {showForm && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center px-4">
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-full max-w-md flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-mono font-semibold text-gray-100">Novo Rastro</h3>
+              <button
+                onClick={() => { setShowForm(false); setFormErr(null) }}
+                className="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none"
+              >
+                ×
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitForm} className="flex flex-col gap-3">
+              <div>
+                <label className={labelCls}>Query (única) *</label>
+                <input
+                  type="text"
+                  value={formQuery}
+                  onChange={e => setFormQuery(e.target.value)}
+                  required
+                  className={inputCls}
+                  placeholder='ex: "quiz saúde mãe"'
+                />
+              </div>
+
+              <div>
+                <label className={labelCls}>Grupo *</label>
+                <select
+                  value={formGrupo}
+                  onChange={e => setFormGrupo(e.target.value as RastroGrupo | '')}
+                  required
+                  className={inputCls}
+                >
+                  <option value="">— selecionar —</option>
+                  {RASTRO_GRUPO_OPTS.map(g => (
+                    <option key={g} value={g}>{g}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className={labelCls}>Tipo de Busca *</label>
+                <select
+                  value={formTipoBusca}
+                  onChange={e => setFormTipoBusca(e.target.value as 'plataforma' | 'nicho')}
+                  className={inputCls}
+                >
+                  {RASTRO_TIPO_BUSCA_OPTS.map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className={labelCls}>Hint de Funil (opcional)</label>
+                <input
+                  type="text"
+                  value={formFunilHint}
+                  onChange={e => setFormFunilHint(e.target.value)}
+                  className={inputCls}
+                  placeholder="ex: Quiz"
+                />
+              </div>
+
+              {formErr && (
+                <p className="text-amber-400 text-xs font-mono mt-1">{formErr}</p>
+              )}
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  type="submit"
+                  disabled={insertMutation.isPending}
+                  className="flex-1 bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+                >
+                  {insertMutation.isPending ? 'Inserindo...' : 'Adicionar'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setShowForm(false); setFormErr(null) }}
+                  disabled={insertMutation.isPending}
+                  className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+                >
+                  Cancelar
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Tabela */}
+      {(!rastros || rastros.length === 0) ? (
+        <p className="text-gray-600 font-mono text-sm py-8 text-center">Nenhum rastro cadastrado ainda.</p>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-gray-800">
+          <table className="w-full text-xs font-mono">
+            <thead>
+              <tr className="border-b border-gray-800 bg-gray-900/60">
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Query</th>
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Grupo</th>
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Tipo Busca</th>
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Funil Hint</th>
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Pop. observada</th>
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Status</th>
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Criado em</th>
+                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Ações</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rastros.map((r: Rastro) => {
+                const es = editState[r.id]
+                const isSemRetorno = r.status === 'sem_retorno'
+                const statusCfg = RASTRO_STATUS_CFG[r.status] ?? RASTRO_STATUS_CFG.a_testar
+
+                return (
+                  <tr
+                    key={r.id}
+                    className={`border-b border-gray-800/40 hover:bg-gray-900/50 ${isSemRetorno ? 'opacity-60' : ''}`}
+                  >
+                    {/* Query — somente leitura, imutável */}
+                    <td className="px-3 py-2.5 max-w-[200px]">
+                      <span className={`font-mono text-gray-200 truncate block ${isSemRetorno ? 'line-through' : ''}`}>
+                        {r.query}
+                      </span>
+                    </td>
+
+                    {/* Grupo — dropdown inline */}
+                    <td className="px-3 py-2.5">
+                      {es ? (
+                        <select
+                          value={es.grupo}
+                          onChange={e => {
+                            const novoGrupo = e.target.value as RastroGrupo
+                            setEditState(prev => ({ ...prev, [r.id]: { ...prev[r.id], grupo: novoGrupo } }))
+                            handleUpdateRastro(r.id, { grupo: novoGrupo })
+                          }}
+                          className={inlineSelectCls}
+                        >
+                          {RASTRO_GRUPO_OPTS.map(g => (
+                            <option key={g} value={g}>{g}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="text-gray-400">{r.grupo}</span>
+                      )}
+                    </td>
+
+                    {/* Tipo de Busca — dropdown inline com badge de aviso */}
+                    <td className="px-3 py-2.5 whitespace-nowrap">
+                      {es ? (
+                        <div className="flex items-center gap-1 flex-wrap">
+                          <select
+                            value={es.tipo_busca}
+                            onChange={e => {
+                              const novoTipo = e.target.value as 'plataforma' | 'nicho'
+                              setEditState(prev => ({ ...prev, [r.id]: { ...prev[r.id], tipo_busca: novoTipo } }))
+                              handleUpdateRastro(r.id, { tipo_busca: novoTipo })
+                            }}
+                            className={inlineSelectCls}
+                          >
+                            {RASTRO_TIPO_BUSCA_OPTS.map(t => (
+                              <option key={t} value={t}>{t}</option>
+                            ))}
+                          </select>
+                          {es.tipo_busca === 'nicho' && (
+                            <span className="ml-1 text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/25 px-1.5 py-0.5 rounded whitespace-nowrap">
+                              não roda no ciclo atual
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1">
+                          <span className="text-gray-400">{r.tipo_busca}</span>
+                          {r.tipo_busca === 'nicho' && (
+                            <span className="ml-1 text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/25 px-1.5 py-0.5 rounded whitespace-nowrap">
+                              não roda no ciclo atual
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </td>
+
+                    {/* Funil Hint — input inline com onBlur */}
+                    <td className="px-3 py-2.5">
+                      {es ? (
+                        <input
+                          type="text"
+                          value={es.funil_hint}
+                          onChange={e => setEditState(prev => ({ ...prev, [r.id]: { ...prev[r.id], funil_hint: e.target.value } }))}
+                          onBlur={() => {
+                            const novoHint = es.funil_hint.trim() || null
+                            const hintAtual = r.funil_hint ?? null
+                            if (novoHint !== hintAtual) {
+                              handleUpdateRastro(r.id, { funil_hint: novoHint })
+                            }
+                          }}
+                          className={`${inlineInputCls} w-24`}
+                          placeholder="—"
+                        />
+                      ) : (
+                        <span className="text-gray-500">{r.funil_hint ?? '—'}</span>
+                      )}
+                    </td>
+
+                    {/* Pop. Observada — input numérico inline com onBlur */}
+                    <td className="px-3 py-2.5">
+                      {es ? (
+                        <input
+                          type="number"
+                          value={es.populacao_observada}
+                          onChange={e => setEditState(prev => ({ ...prev, [r.id]: { ...prev[r.id], populacao_observada: e.target.value } }))}
+                          onBlur={() => {
+                            const novoVal = es.populacao_observada.trim() !== ''
+                              ? parseInt(es.populacao_observada, 10)
+                              : null
+                            const valAtual = r.populacao_observada ?? null
+                            if (novoVal !== valAtual) {
+                              handleUpdateRastro(r.id, { populacao_observada: novoVal })
+                            }
+                          }}
+                          className={`${inlineInputCls} w-16`}
+                          placeholder="—"
+                        />
+                      ) : (
+                        <span className="text-gray-500">{r.populacao_observada ?? '—'}</span>
+                      )}
+                    </td>
+
+                    {/* Status — badge colorido */}
+                    <td className="px-3 py-2.5">
+                      <span className={`text-[11px] font-mono px-2 py-0.5 rounded-full whitespace-nowrap ${statusCfg.cls}`}>
+                        {statusCfg.label}
+                      </span>
+                    </td>
+
+                    {/* Criado em */}
+                    <td className="px-3 py-2.5 text-gray-600 whitespace-nowrap">
+                      {fmtDate(r.criado_em)}
+                    </td>
+
+                    {/* Ações — toggle Pausar/Reativar; SEM botão de excluir */}
+                    <td className="px-3 py-2.5 whitespace-nowrap">
+                      {isSemRetorno ? (
+                        <button
+                          onClick={() => handleUpdateRastro(r.id, { status: 'a_testar' })}
+                          disabled={rastroMutation.isPending}
+                          className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 transition-colors disabled:opacity-50 whitespace-nowrap"
+                        >
+                          Reativar
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleUpdateRastro(r.id, { status: 'sem_retorno' })}
+                          disabled={rastroMutation.isPending}
+                          className="text-[10px] px-2 py-0.5 rounded border border-gray-600/40 text-gray-400 hover:bg-gray-700/20 transition-colors disabled:opacity-50 whitespace-nowrap"
+                        >
+                          Pausar
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+          <p className="text-xs font-mono text-gray-700 px-3 py-2">
+            {rastros.length} rastro{rastros.length !== 1 ? 's' : ''}
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Página principal ──────────────────────────────────────────────────────────
 
 export function LowTicket() {
@@ -1526,7 +1947,7 @@ export function LowTicket() {
         {aba === 'candidatas' && <CandidatasTab />}
         {aba === 'infoapp'    && <InfoappTab />}
         {aba === 'arquivo'    && <ArquivoTab />}
-        {aba === 'rastros'    && <EmBreve />}
+        {aba === 'rastros'    && <RastrosTab />}
       </main>
     </div>
   )
