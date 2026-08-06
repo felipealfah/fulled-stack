@@ -40,6 +40,7 @@ export interface Oferta {
   page_id: string | null
   anunciante: string | null
   link_ad_library: string | null
+  pais: string | null
   nicho: string | null
   tipo_funil: TipoFunil | null
   formato_entregavel: FormatoEntregavel | null
@@ -219,4 +220,20 @@ export async function insertOferta(
 
   if (error) throw error
   return data as Oferta
+}
+
+/**
+ * Busca uma oferta por page_id. Retorna null se não encontrar.
+ * Usado para dedup no FR-9 (oferta manual).
+ */
+export async function fetchOfertaByPageId(pageId: string): Promise<Oferta | null> {
+  const { data, error } = await supabaseLT
+    .from('ofertas')
+    .select('*')
+    .eq('page_id', pageId)
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+  return data as Oferta | null
 }

@@ -1,11 +1,16 @@
-import { useState, useMemo } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useState, useMemo, useEffect } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   fetchOfertasCounts,
   fetchGate,
   fetchAtualizadoEm,
+  fetchOfertaByPageId,
+  updateOferta,
+  insertOferta,
   type Oferta,
   type OfertaStatus,
+  type TipoFunil,
+  type FormatoEntregavel,
 } from '../lib/lowticket'
 
 // ── Status config ─────────────────────────────────────────────────────────────
@@ -51,10 +56,507 @@ function StatusChip({ status }: { status: OfertaStatus }) {
   )
 }
 
+// ── Painel de análise lateral ─────────────────────────────────────────────────
+
+const TIPO_FUNIL_OPTS: Array<TipoFunil | ''> = ['', 'Quiz', 'Quiz + PV', 'Quiz + VSL', 'VSL', 'PV + VSL', 'PV']
+const FORMATO_OPTS: Array<FormatoEntregavel | ''> = ['', 'educacao', 'ferramenta', 'servico', 'comunidade', 'fisico', 'outro']
+
+interface PainelAnaliseProps {
+  oferta: Oferta
+  onClose: () => void
+  onSaved: () => void
+}
+
+function PainelAnalise({ oferta, onClose, onSaved }: PainelAnaliseProps) {
+  const queryClient = useQueryClient()
+
+  // ── Estado local dos campos editáveis
+  const [tipoFunil, setTipoFunil] = useState<TipoFunil | ''>(oferta.tipo_funil ?? '')
+  const [formato, setFormato] = useState<FormatoEntregavel | ''>(oferta.formato_entregavel ?? '')
+  const [expert, setExpert] = useState<boolean>(oferta.expert ?? false)
+  const [infoapp, setInfoapp] = useState<boolean>(oferta.oportunidade_infoapp ?? false)
+  const [nicho, setNicho] = useState<string>(oferta.nicho ?? '')
+  const [obs, setObs] = useState<string>(oferta.observacoes ?? '')
+  const [confirmDialog, setConfirmDialog] = useState<'monitorar' | 'descartar' | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  // Re-inicializa quando oferta muda
+  useEffect(() => {
+    setTipoFunil(oferta.tipo_funil ?? '')
+    setFormato(oferta.formato_entregavel ?? '')
+    setExpert(oferta.expert ?? false)
+    setInfoapp(oferta.oportunidade_infoapp ?? false)
+    setNicho(oferta.nicho ?? '')
+    setObs(oferta.observacoes ?? '')
+    setSaveError(null)
+    setConfirmDialog(null)
+  }, [oferta.id])
+
+  // ── Mutation: Salvar campos editáveis
+  const saveMutation = useMutation({
+    mutationFn: () =>
+      updateOferta(oferta.id, {
+        tipo_funil: tipoFunil || null,
+        formato_entregavel: formato || null,
+        expert,
+        oportunidade_infoapp: infoapp,
+        nicho: nicho || null,
+        observacoes: obs || null,
+        ...(oferta.status === 'alerta' ? { status: 'em_analise_funil' as OfertaStatus } : {}),
+      }),
+    onSuccess: () => {
+      setSaveError(null)
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+      onSaved()
+    },
+    onError: (err: Error) => {
+      setSaveError(err.message ?? 'Erro ao salvar')
+    },
+  })
+
+  // ── Mutation: Monitorar
+  const monitorarMutation = useMutation({
+    mutationFn: () =>
+      updateOferta(oferta.id, {
+        status: 'monitorando',
+        data_inicio_monitoramento: new Date().toISOString().split('T')[0],
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      setConfirmDialog(null)
+      onClose()
+    },
+  })
+
+  // ── Mutation: Descartar
+  const descartarMutation = useMutation({
+    mutationFn: () =>
+      updateOferta(oferta.id, { status: 'descartada' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      setConfirmDialog(null)
+      onClose()
+    },
+  })
+
+  const saving = saveMutation.isPending
+  const acting = monitorarMutation.isPending || descartarMutation.isPending
+
+  // ── Estilos reutilizáveis
+  const labelCls = 'text-xs font-mono text-gray-500 mb-1 block'
+  const inputCls = 'w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-100 focus:outline-none focus:border-violet-500'
+
+  return (
+    <>
+      {/* Painel */}
+      <div className="w-80 shrink-0 bg-gray-900 border border-gray-800 rounded-xl p-4 flex flex-col gap-3 self-start">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex flex-col gap-1 min-w-0">
+            <h3 className="text-sm font-mono font-semibold text-gray-100 truncate">
+              {oferta.anunciante ?? '—'}
+            </h3>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <StatusChip status={oferta.status} />
+              {oferta.vertical_risco === true && (
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 border border-red-500/40 whitespace-nowrap">
+                  ⚠️ Risco
+                </span>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-600 hover:text-gray-300 transition-colors shrink-0 text-lg leading-none"
+          >
+            ×
+          </button>
+        </div>
+
+        {/* Seção de enriquecimento — somente leitura */}
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+          <div>
+            <p className="text-xs font-mono text-gray-500">Vertical</p>
+            <p className="text-sm font-mono text-gray-300">{oferta.vertical ?? '—'}</p>
+          </div>
+          <div>
+            <p className="text-xs font-mono text-gray-500">Mercado</p>
+            <p className="text-sm font-mono text-gray-300">{oferta.mercado ?? '—'}</p>
+          </div>
+          <div>
+            <p className="text-xs font-mono text-gray-500">Preço</p>
+            <p className="text-sm font-mono text-gray-300">{oferta.preco_visivel ?? '—'}</p>
+          </div>
+          <div>
+            <p className="text-xs font-mono text-gray-500">Criativos</p>
+            <p className="text-sm font-mono text-gray-300">
+              {fmtMix(oferta.n_criativos_video, oferta.n_criativos_imagem)}
+            </p>
+          </div>
+        </div>
+
+        <div className="border-t border-gray-800 my-0" />
+
+        {/* Campos editáveis */}
+        <div className="flex flex-col gap-3">
+          {/* Tipo de Funil */}
+          <div>
+            <label className={labelCls}>Tipo de Funil</label>
+            <select
+              value={tipoFunil}
+              onChange={e => setTipoFunil(e.target.value as TipoFunil | '')}
+              className={inputCls}
+            >
+              {TIPO_FUNIL_OPTS.map(o => (
+                <option key={o} value={o}>{o === '' ? '— selecionar —' : o}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Formato */}
+          <div>
+            <label className={labelCls}>Formato</label>
+            <select
+              value={formato}
+              onChange={e => setFormato(e.target.value as FormatoEntregavel | '')}
+              className={inputCls}
+            >
+              {FORMATO_OPTS.map(o => (
+                <option key={o} value={o}>{o === '' ? '— selecionar —' : o}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Toggles */}
+          <div className="flex items-center gap-4">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={expert}
+                onChange={e => setExpert(e.target.checked)}
+                className="accent-violet-500 w-4 h-4"
+              />
+              <span className="text-sm font-mono text-gray-300">Expert</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={infoapp}
+                onChange={e => setInfoapp(e.target.checked)}
+                className="accent-amber-400 w-4 h-4"
+              />
+              <span className="text-sm font-mono text-gray-300">⭐ Infoapp</span>
+            </label>
+          </div>
+
+          {/* Nicho */}
+          <div>
+            <label className={labelCls}>Nicho</label>
+            <input
+              type="text"
+              value={nicho}
+              onChange={e => setNicho(e.target.value)}
+              className={inputCls}
+              placeholder="ex: emagrecimento, finanças..."
+            />
+          </div>
+
+          {/* Observações */}
+          <div>
+            <label className={labelCls}>Observações</label>
+            <textarea
+              rows={3}
+              value={obs}
+              onChange={e => setObs(e.target.value)}
+              className={`${inputCls} resize-none`}
+              placeholder="Anotações sobre a oferta..."
+            />
+          </div>
+
+          {/* Erro de salvar */}
+          {saveError && (
+            <p className="text-red-400 text-xs font-mono">{saveError}</p>
+          )}
+
+          {/* Botão Salvar */}
+          <button
+            onClick={() => saveMutation.mutate()}
+            disabled={saving}
+            className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+          >
+            {saving ? 'Salvando...' : 'Salvar'}
+          </button>
+        </div>
+
+        <div className="border-t border-gray-800 my-0" />
+
+        {/* Ações finais */}
+        <div className="flex flex-col gap-2">
+          <button
+            onClick={() => setConfirmDialog('monitorar')}
+            disabled={oferta.status === 'monitorando' || acting}
+            className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+          >
+            Monitorar
+          </button>
+          <button
+            onClick={() => setConfirmDialog('descartar')}
+            disabled={acting}
+            className="bg-red-700/80 hover:bg-red-700 disabled:opacity-50 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+          >
+            Descartar
+          </button>
+        </div>
+      </div>
+
+      {/* Confirm dialog — overlay */}
+      {confirmDialog !== null && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-80 flex flex-col gap-4">
+            <p className="text-sm font-mono text-gray-200">
+              Confirmar:{' '}
+              <span className={confirmDialog === 'monitorar' ? 'text-emerald-400' : 'text-red-400'}>
+                {confirmDialog === 'monitorar' ? 'Monitorar' : 'Descartar'}
+              </span>{' '}
+              esta oferta?
+            </p>
+            <p className="text-xs font-mono text-gray-500">
+              {oferta.anunciante ?? '—'}
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => {
+                  if (confirmDialog === 'monitorar') monitorarMutation.mutate()
+                  else descartarMutation.mutate()
+                }}
+                disabled={acting}
+                className={`flex-1 font-mono text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-60 ${
+                  confirmDialog === 'monitorar'
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                    : 'bg-red-700/80 hover:bg-red-700 text-white'
+                }`}
+              >
+                {acting ? 'Aguarde...' : 'Confirmar'}
+              </button>
+              <button
+                onClick={() => setConfirmDialog(null)}
+                disabled={acting}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
+// ── Modal: Oferta Manual (FR-9) ───────────────────────────────────────────────
+
+interface ModalOfertaManualProps {
+  onClose: () => void
+  onOfertaExistente: (oferta: Oferta) => void
+  onOfertaCriada: () => void
+}
+
+function ModalOfertaManual({ onClose, onOfertaExistente, onOfertaCriada }: ModalOfertaManualProps) {
+  const queryClient = useQueryClient()
+  const [pageIdInput, setPageIdInput] = useState('')
+  const [anunciante, setAnunciante] = useState('')
+  const [nicho, setNicho] = useState('')
+  const [obsInput, setObsInput] = useState('')
+  const [formError, setFormError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+
+  const labelCls = 'text-xs font-mono text-gray-500 mb-1 block'
+  const inputCls = 'w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-100 focus:outline-none focus:border-violet-500'
+
+  function extractPageId(raw: string): string {
+    const trimmed = raw.trim()
+    if (trimmed.includes('view_all_page_id=')) {
+      try {
+        const qsPart = trimmed.split('?')[1] ?? ''
+        const id = new URLSearchParams(qsPart).get('view_all_page_id')
+        return id ?? trimmed
+      } catch {
+        return trimmed
+      }
+    }
+    return trimmed
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setFormError(null)
+
+    const pageId = extractPageId(pageIdInput)
+    if (!pageId) {
+      setFormError('Page ID é obrigatório.')
+      return
+    }
+
+    // Validação: page_id deve ser numérico (T-34-04)
+    if (!/^\d+$/.test(pageId)) {
+      setFormError('Page ID deve conter apenas números.')
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      // Dedup: verificar se já existe
+      const existente = await fetchOfertaByPageId(pageId)
+      if (existente !== null) {
+        onClose()
+        onOfertaExistente(existente)
+        return
+      }
+
+      // Prefixar observações com "origem: manual (Board)\n"
+      const obsFinal = `origem: manual (Board)\n${obsInput}`.trimEnd()
+
+      await insertOferta({
+        page_id: pageId,
+        anunciante: anunciante.trim() || null,
+        nicho: nicho.trim() || null,
+        observacoes: obsFinal,
+        status: 'alerta',
+        pais: 'MULTI',
+        link_ad_library: `https://www.facebook.com/ads/library/?view_all_page_id=${pageId}`,
+      } as Parameters<typeof insertOferta>[0])
+
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+      onOfertaCriada()
+      onClose()
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Erro ao inserir oferta'
+      setFormError(msg)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center px-4">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-full max-w-md flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-mono font-semibold text-gray-100">Adicionar Oferta Manual</h2>
+          <button
+            onClick={onClose}
+            className="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none"
+          >
+            ×
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+          <div>
+            <label className={labelCls}>Page ID ou Link *</label>
+            <input
+              type="text"
+              value={pageIdInput}
+              onChange={e => setPageIdInput(e.target.value)}
+              required
+              className={inputCls}
+              placeholder="123456789 ou https://facebook.com/ads/library/?view_all_page_id=..."
+            />
+            <p className="text-xs font-mono text-gray-600 mt-1">
+              Cole o link da Biblioteca ou o Page ID diretamente.
+            </p>
+          </div>
+
+          <div>
+            <label className={labelCls}>Anunciante (opcional)</label>
+            <input
+              type="text"
+              value={anunciante}
+              onChange={e => setAnunciante(e.target.value)}
+              className={inputCls}
+              placeholder="Nome do anunciante"
+            />
+          </div>
+
+          <div>
+            <label className={labelCls}>Nicho (opcional)</label>
+            <input
+              type="text"
+              value={nicho}
+              onChange={e => setNicho(e.target.value)}
+              className={inputCls}
+              placeholder="ex: emagrecimento, finanças..."
+            />
+          </div>
+
+          <div>
+            <label className={labelCls}>Observações (opcional)</label>
+            <textarea
+              rows={3}
+              value={obsInput}
+              onChange={e => setObsInput(e.target.value)}
+              className={`${inputCls} resize-none`}
+              placeholder="Anotações adicionais..."
+            />
+            <p className="text-xs font-mono text-gray-700 mt-1">
+              Prefixado automaticamente com "origem: manual (Board)"
+            </p>
+          </div>
+
+          {formError && (
+            <p className="text-red-400 text-xs font-mono">{formError}</p>
+          )}
+
+          <div className="flex gap-2 pt-1">
+            <button
+              type="submit"
+              disabled={submitting}
+              className="flex-1 bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+            >
+              {submitting ? 'Verificando...' : 'Salvar'}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={submitting}
+              className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// ── Toast simples ─────────────────────────────────────────────────────────────
+
+function Toast({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 3000)
+    return () => clearTimeout(t)
+  }, [onDismiss])
+
+  return (
+    <div className="fixed top-4 right-4 z-50 bg-amber-500/20 border border-amber-500/40 text-amber-300 font-mono text-sm px-4 py-3 rounded-xl shadow-lg">
+      {message}
+    </div>
+  )
+}
+
 // ── Aba Gate ──────────────────────────────────────────────────────────────────
 
 function GateTab() {
   const [filtroMercado, setFiltroMercado] = useState<string>('')
+  const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
+  const [showManualForm, setShowManualForm] = useState(false)
+  const [toastMsg, setToastMsg] = useState<string | null>(null)
 
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-gate'],
@@ -79,6 +581,16 @@ function GateTab() {
     return ofertas.filter(o => o.mercado === filtroMercado)
   }, [ofertas, filtroMercado])
 
+  // Manter selectedOferta sincronizada com dados atualizados
+  const selectedOfertaAtualizada = useMemo(() => {
+    if (!selectedOferta || !ofertas) return selectedOferta
+    return ofertas.find(o => o.id === selectedOferta.id) ?? selectedOferta
+  }, [selectedOferta, ofertas])
+
+  function handleRowClick(o: Oferta) {
+    setSelectedOferta(prev => (prev?.id === o.id ? null : o))
+  }
+
   if (isLoading) {
     return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando gate...</p>
   }
@@ -88,157 +600,208 @@ function GateTab() {
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Filtro por mercado */}
-      {mercados.length > 0 && (
+      {/* Barra de ações e filtro */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        {/* Filtro por mercado */}
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-xs font-mono text-gray-600 mr-1">Mercado:</span>
-          <button
-            onClick={() => setFiltroMercado('')}
-            className={`text-xs font-mono px-3 py-1 rounded-full border transition-colors ${
-              filtroMercado === ''
-                ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
-                : 'border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
-            }`}
-          >
-            Todos
-          </button>
-          {mercados.map(m => (
-            <button
-              key={m}
-              onClick={() => setFiltroMercado(m === filtroMercado ? '' : m)}
-              className={`text-xs font-mono px-3 py-1 rounded-full border transition-colors ${
-                filtroMercado === m
-                  ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
-                  : 'border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
-              }`}
-            >
-              {m}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* Tabela Gate */}
-      <div className="overflow-x-auto rounded-xl border border-gray-800">
-        <table className="w-full text-sm font-mono">
-          <thead>
-            <tr className="border-b border-gray-800 bg-gray-900/60">
-              <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
-            </tr>
-          </thead>
-          <tbody>
-            {ofertasFiltradas.length === 0 && (
-              <tr>
-                <td colSpan={12} className="px-4 py-12 text-center text-gray-600 text-sm">
-                  Nenhuma oferta no Gate
-                </td>
-              </tr>
-            )}
-            {ofertasFiltradas.map((o: Oferta) => (
-              <tr
-                key={o.id}
-                className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors"
+          {mercados.length > 0 && (
+            <>
+              <span className="text-xs font-mono text-gray-600 mr-1">Mercado:</span>
+              <button
+                onClick={() => setFiltroMercado('')}
+                className={`text-xs font-mono px-3 py-1 rounded-full border transition-colors ${
+                  filtroMercado === ''
+                    ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
+                    : 'border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                }`}
               >
-                {/* Anunciante — clicável (painel de análise no Plan 02) */}
-                <td className="px-4 py-3 max-w-[160px]">
-                  <button
-                    onClick={() => console.log(o.id)}
-                    className="text-left text-gray-200 hover:text-violet-300 transition-colors truncate max-w-full flex items-center gap-1.5"
-                  >
-                    {o.vertical_risco && (
-                      <span className="text-red-400 shrink-0" title="Vertical de risco">⚠️</span>
-                    )}
-                    <span className="truncate">{o.anunciante ?? '—'}</span>
-                  </button>
-                </td>
+                Todos
+              </button>
+              {mercados.map(m => (
+                <button
+                  key={m}
+                  onClick={() => setFiltroMercado(m === filtroMercado ? '' : m)}
+                  className={`text-xs font-mono px-3 py-1 rounded-full border transition-colors ${
+                    filtroMercado === m
+                      ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
+                      : 'border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </>
+          )}
+        </div>
 
-                {/* Mix criativos */}
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
-                  {fmtMix(o.n_criativos_video, o.n_criativos_imagem)}
-                </td>
+        {/* Botão oferta manual */}
+        <button
+          onClick={() => setShowManualForm(true)}
+          className="text-xs font-mono px-3 py-1.5 rounded-lg border border-violet-500/40 text-violet-400 hover:bg-violet-500/10 transition-colors whitespace-nowrap"
+        >
+          + Oferta manual
+        </button>
+      </div>
 
-                {/* Ativos */}
-                <td className="px-3 py-3 text-gray-300">
-                  {o.n_anuncios_ativos ?? '—'}
-                </td>
-
-                {/* Dias */}
-                <td className="px-3 py-3 text-gray-400">
-                  {o.dias_ativo_oferta ?? '—'}
-                </td>
-
-                {/* Nicho */}
-                <td className="px-3 py-3 text-gray-400 max-w-[120px]">
-                  <span className="truncate block">{o.nicho ?? '—'}</span>
-                </td>
-
-                {/* Mercado */}
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
-                  {o.mercado ?? '—'}
-                </td>
-
-                {/* Preço */}
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
-                  {o.preco_visivel ?? '—'}
-                </td>
-
-                {/* Formato + star infoapp */}
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
-                  {o.oportunidade_infoapp && <span className="text-amber-400 mr-1">⭐</span>}
-                  {o.formato_entregavel ?? '—'}
-                </td>
-
-                {/* Funil */}
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
-                  {o.tipo_funil ?? '—'}
-                </td>
-
-                {/* Status chip */}
-                <td className="px-3 py-3">
-                  <StatusChip status={o.status} />
-                </td>
-
-                {/* Atualizado em */}
-                <td className="px-3 py-3 text-gray-600 text-xs whitespace-nowrap">
-                  {fmtDate(o.atualizado_em)}
-                </td>
-
-                {/* Botão biblioteca */}
-                <td className="px-3 py-3">
-                  {o.link_ad_library ? (
-                    <a
-                      href={o.link_ad_library}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs font-mono text-violet-400 hover:text-violet-300 border border-violet-500/30 px-2 py-1 rounded transition-colors whitespace-nowrap"
-                    >
-                      Biblioteca
-                    </a>
-                  ) : (
-                    <span className="text-gray-700 text-xs">—</span>
-                  )}
-                </td>
+      {/* Layout: tabela + painel */}
+      <div className={selectedOferta ? 'flex gap-4 items-start' : ''}>
+        {/* Tabela Gate */}
+        <div className={`overflow-x-auto rounded-xl border border-gray-800 ${selectedOferta ? 'flex-1 min-w-0' : ''}`}>
+          <table className="w-full text-sm font-mono">
+            <thead>
+              <tr className="border-b border-gray-800 bg-gray-900/60">
+                <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {ofertasFiltradas.length === 0 && (
+                <tr>
+                  <td colSpan={12} className="px-4 py-12 text-center text-gray-600 text-sm">
+                    Nenhuma oferta no Gate
+                  </td>
+                </tr>
+              )}
+              {ofertasFiltradas.map((o: Oferta) => {
+                const isSelected = selectedOferta?.id === o.id
+                return (
+                  <tr
+                    key={o.id}
+                    className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors ${
+                      isSelected ? 'bg-violet-500/5 border-l-2 border-l-violet-500' : ''
+                    }`}
+                  >
+                    {/* Anunciante — clicável */}
+                    <td className="px-4 py-3 max-w-[160px]">
+                      <button
+                        onClick={() => handleRowClick(o)}
+                        className="text-left text-gray-200 hover:text-violet-300 transition-colors truncate max-w-full flex items-center gap-1.5"
+                      >
+                        {o.vertical_risco && (
+                          <span className="text-red-400 shrink-0" title="Vertical de risco">⚠️</span>
+                        )}
+                        <span className="truncate">{o.anunciante ?? '—'}</span>
+                      </button>
+                    </td>
+
+                    {/* Mix criativos */}
+                    <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                      {fmtMix(o.n_criativos_video, o.n_criativos_imagem)}
+                    </td>
+
+                    {/* Ativos */}
+                    <td className="px-3 py-3 text-gray-300">
+                      {o.n_anuncios_ativos ?? '—'}
+                    </td>
+
+                    {/* Dias */}
+                    <td className="px-3 py-3 text-gray-400">
+                      {o.dias_ativo_oferta ?? '—'}
+                    </td>
+
+                    {/* Nicho */}
+                    <td className="px-3 py-3 text-gray-400 max-w-[120px]">
+                      <span className="truncate block">{o.nicho ?? '—'}</span>
+                    </td>
+
+                    {/* Mercado */}
+                    <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                      {o.mercado ?? '—'}
+                    </td>
+
+                    {/* Preço */}
+                    <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                      {o.preco_visivel ?? '—'}
+                    </td>
+
+                    {/* Formato + star infoapp */}
+                    <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                      {o.oportunidade_infoapp && <span className="text-amber-400 mr-1">⭐</span>}
+                      {o.formato_entregavel ?? '—'}
+                    </td>
+
+                    {/* Funil */}
+                    <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
+                      {o.tipo_funil ?? '—'}
+                    </td>
+
+                    {/* Status chip */}
+                    <td className="px-3 py-3">
+                      <StatusChip status={o.status} />
+                    </td>
+
+                    {/* Atualizado em */}
+                    <td className="px-3 py-3 text-gray-600 text-xs whitespace-nowrap">
+                      {fmtDate(o.atualizado_em)}
+                    </td>
+
+                    {/* Botão biblioteca */}
+                    <td className="px-3 py-3">
+                      {o.link_ad_library ? (
+                        <a
+                          href={o.link_ad_library}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs font-mono text-violet-400 hover:text-violet-300 border border-violet-500/30 px-2 py-1 rounded transition-colors whitespace-nowrap"
+                        >
+                          Biblioteca
+                        </a>
+                      ) : (
+                        <span className="text-gray-700 text-xs">—</span>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Painel lateral */}
+        {selectedOfertaAtualizada && (
+          <PainelAnalise
+            oferta={selectedOfertaAtualizada}
+            onClose={() => setSelectedOferta(null)}
+            onSaved={() => {
+              // onSaved: painel permanece aberto após salvar — só fecha em Monitorar/Descartar
+            }}
+          />
+        )}
       </div>
 
       <p className="text-xs font-mono text-gray-700">
         {ofertasFiltradas.length} oferta{ofertasFiltradas.length !== 1 ? 's' : ''} no gate
         {filtroMercado ? ` · mercado: ${filtroMercado}` : ''}
       </p>
+
+      {/* Modal oferta manual */}
+      {showManualForm && (
+        <ModalOfertaManual
+          onClose={() => setShowManualForm(false)}
+          onOfertaExistente={(oferta) => {
+            setSelectedOferta(oferta)
+            setToastMsg('Oferta já existe para este page_id')
+          }}
+          onOfertaCriada={() => {
+            setToastMsg(null)
+          }}
+        />
+      )}
+
+      {/* Toast */}
+      {toastMsg && (
+        <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />
+      )}
     </div>
   )
 }
