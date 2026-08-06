@@ -355,3 +355,58 @@ export async function fetchSparklines(
   }
   return result
 }
+
+// ── Helpers de Rastros (FR-10) ────────────────────────────────────────────────
+
+/**
+ * Retorna todos os rastros ordenados por criado_em DESC.
+ * Doutrina: nenhum método .delete() é usado neste módulo para rastros.
+ */
+export async function fetchRastros(): Promise<Rastro[]> {
+  const { data, error } = await supabaseLT
+    .from('rastros')
+    .select('*')
+    .order('criado_em', { ascending: false })
+
+  if (error) throw error
+  return (data ?? []) as Rastro[]
+}
+
+/**
+ * Insere um novo rastro com status='a_testar'.
+ * Lança erro específico se query já existe (unique constraint 23505).
+ * Retorna o rastro inserido.
+ */
+export async function insertRastro(
+  fields: { query: string; grupo: RastroGrupo; tipo_busca: 'plataforma' | 'nicho'; funil_hint?: string | null }
+): Promise<Rastro> {
+  const { data, error } = await supabaseLT
+    .from('rastros')
+    .insert({ ...fields, status: 'a_testar' })
+    .select()
+    .single()
+
+  if (error) {
+    if (error.code === '23505') {
+      throw new Error('Rastro com esta query já existe')
+    }
+    throw error
+  }
+  return data as Rastro
+}
+
+/**
+ * Atualiza campos permitidos de um rastro. O campo `query` é imutável pós-criação.
+ * Nunca chama .delete() — "excluir" = updateRastro(id, { status: 'sem_retorno' }).
+ */
+export async function updateRastro(
+  id: string,
+  patch: Partial<Pick<Rastro, 'grupo' | 'tipo_busca' | 'funil_hint' | 'populacao_observada' | 'status'>>
+): Promise<void> {
+  const { error } = await supabaseLT
+    .from('rastros')
+    .update(patch)
+    .eq('id', id)
+
+  if (error) throw error
+}
