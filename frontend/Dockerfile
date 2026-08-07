@@ -11,6 +11,14 @@ COPY package.json package-lock.json ./
 # `npm ci` e deterministico — exige package-lock.json presente
 RUN npm ci
 
+# Build args para variáveis Vite (injetadas em build-time, não em runtime)
+ARG VITE_API_URL
+ARG VITE_LOWTICKET_SUPABASE_URL
+ARG VITE_LOWTICKET_SUPABASE_PB_KEY
+ENV VITE_API_URL=$VITE_API_URL
+ENV VITE_LOWTICKET_SUPABASE_URL=$VITE_LOWTICKET_SUPABASE_URL
+ENV VITE_LOWTICKET_SUPABASE_PB_KEY=$VITE_LOWTICKET_SUPABASE_PB_KEY
+
 # Copia o resto do codigo-fonte
 COPY . .
 

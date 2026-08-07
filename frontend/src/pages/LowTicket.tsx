@@ -1399,14 +1399,6 @@ function ArquivoTab() {
   )
 }
 
-// ── Placeholder para abas futuras ─────────────────────────────────────────────
-
-function EmBreve() {
-  return (
-    <p className="text-gray-600 font-mono text-sm py-12 text-center">Em breve</p>
-  )
-}
-
 // ── Aba Rastros (FR-10) ───────────────────────────────────────────────────────
 
 const RASTRO_GRUPO_OPTS: RastroGrupo[] = ['builder', 'checkout', 'resposta_direta', 'nicho']

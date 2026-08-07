@@ -90,6 +90,10 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
+        VITE_LOWTICKET_SUPABASE_URL: ${VITE_LOWTICKET_SUPABASE_URL:-}
+        VITE_LOWTICKET_SUPABASE_PB_KEY: ${VITE_LOWTICKET_SUPABASE_PB_KEY:-}
     container_name: fulled-frontend
     ports:
       - "3001:80"
