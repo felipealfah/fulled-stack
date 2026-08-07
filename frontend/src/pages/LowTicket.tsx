@@ -570,6 +570,38 @@ function Toast({ message, onDismiss }: { message: string; onDismiss: () => void 
   )
 }
 
+// ── Helpers de ordenação (compartilhados) ────────────────────────────────────
+
+function sortRows<T>(rows: T[], key: keyof T, dir: 'asc' | 'desc'): T[] {
+  return [...rows].sort((a, b) => {
+    const va = a[key], vb = b[key]
+    if (va === null || va === undefined) return 1
+    if (vb === null || vb === undefined) return -1
+    const cmp = va < vb ? -1 : va > vb ? 1 : 0
+    return dir === 'asc' ? cmp : -cmp
+  })
+}
+
+function SortTh({ col, label, active, dir, onSort }: {
+  col: string; label: string; active: boolean; dir: 'asc' | 'desc'; onSort: () => void
+}) {
+  return (
+    <th onClick={onSort} className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-300 transition-colors">
+      {label}<span className={`ml-1 ${active ? 'text-violet-400' : 'text-gray-700'}`}>{active ? (dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
+    </th>
+  )
+}
+
+function useSort<K extends string>(def: K, defDir: 'asc' | 'desc' = 'asc') {
+  const [key, setKey] = useState<K>(def)
+  const [dir, setDir] = useState<'asc' | 'desc'>(defDir)
+  const sort = (k: K, numeric?: boolean) => {
+    if (key === k) { setDir(d => d === 'asc' ? 'desc' : 'asc') }
+    else { setKey(k); setDir(numeric ? 'desc' : 'asc') }
+  }
+  return { key, dir, sort }
+}
+
 // ── Aba Gate ──────────────────────────────────────────────────────────────────
 
 function GateTab() {
@@ -577,6 +609,7 @@ function GateTab() {
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
   const [showManualForm, setShowManualForm] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
+  const gs = useSort<'n_anuncios_ativos'|'dias_ativo_oferta'|'nicho'|'mercado'|'preco_visivel'|'formato_entregavel'|'tipo_funil'>('n_anuncios_ativos', 'desc')
 
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-gate'],
@@ -594,12 +627,12 @@ function GateTab() {
     return Array.from(set).sort()
   }, [ofertas])
 
-  // Filtro client-side
+  // Filtro + ordenação client-side
   const ofertasFiltradas = useMemo(() => {
     if (!ofertas) return []
-    if (!filtroMercado) return ofertas
-    return ofertas.filter(o => o.mercado === filtroMercado)
-  }, [ofertas, filtroMercado])
+    const f = filtroMercado ? ofertas.filter(o => o.mercado === filtroMercado) : ofertas
+    return sortRows(f, gs.key as keyof Oferta, gs.dir)
+  }, [ofertas, filtroMercado, gs.key, gs.dir])
 
   // Manter selectedOferta sincronizada com dados atualizados
   const selectedOfertaAtualizada = useMemo(() => {
@@ -672,13 +705,13 @@ function GateTab() {
               <tr className="border-b border-gray-800 bg-gray-900/60">
                 <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+                <SortTh col="n_anuncios_ativos"  label="Ativos"   active={gs.key==='n_anuncios_ativos'}  dir={gs.dir} onSort={() => gs.sort('n_anuncios_ativos', true)} />
+                <SortTh col="dias_ativo_oferta"  label="Dias"     active={gs.key==='dias_ativo_oferta'}  dir={gs.dir} onSort={() => gs.sort('dias_ativo_oferta', true)} />
+                <SortTh col="nicho"              label="Nicho"    active={gs.key==='nicho'}              dir={gs.dir} onSort={() => gs.sort('nicho')} />
+                <SortTh col="mercado"            label="Mercado"  active={gs.key==='mercado'}            dir={gs.dir} onSort={() => gs.sort('mercado')} />
+                <SortTh col="preco_visivel"      label="Preço"    active={gs.key==='preco_visivel'}      dir={gs.dir} onSort={() => gs.sort('preco_visivel')} />
+                <SortTh col="formato_entregavel" label="Formato"  active={gs.key==='formato_entregavel'} dir={gs.dir} onSort={() => gs.sort('formato_entregavel')} />
+                <SortTh col="tipo_funil"         label="Funil"    active={gs.key==='tipo_funil'}         dir={gs.dir} onSort={() => gs.sort('tipo_funil')} />
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
@@ -879,6 +912,12 @@ function TrackerTab() {
     overrideMutation.mutate({ id, status })
   }
 
+  const ts = useSort<'nicho'|'tipo_funil'|'data_inicio_monitoramento'|'dia_1'|'dia_atual'|'delta_7d'|'maximo'|'minimo'>('dia_atual', 'desc')
+  const trackerOrdenados = useMemo(() => {
+    if (!trackerRows) return []
+    return sortRows(trackerRows, ts.key as any, ts.dir)
+  }, [trackerRows, ts.key, ts.dir])
+
   if (loadingTracker) {
     return <p className="text-gray-600 font-mono text-sm py-8 text-center">Carregando tracker...</p>
   }
@@ -909,23 +948,23 @@ function TrackerTab() {
         <thead>
           <tr className="border-b border-gray-800 bg-gray-900/60">
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Anunciante</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Nicho</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Funil</th>
+            <SortTh col="nicho"                     label="Nicho"    active={ts.key==='nicho'}                     dir={ts.dir} onSort={() => ts.sort('nicho')} />
+            <SortTh col="tipo_funil"                label="Funil"    active={ts.key==='tipo_funil'}                dir={ts.dir} onSort={() => ts.sort('tipo_funil')} />
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Expert</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Início</th>
+            <SortTh col="data_inicio_monitoramento" label="Início"   active={ts.key==='data_inicio_monitoramento'} dir={ts.dir} onSort={() => ts.sort('data_inicio_monitoramento')} />
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Status</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Dia 1</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Dia atual</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Δ7d</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Máx</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Mín</th>
+            <SortTh col="dia_1"    label="Dia 1"    active={ts.key==='dia_1'}    dir={ts.dir} onSort={() => ts.sort('dia_1', true)} />
+            <SortTh col="dia_atual" label="Dia atual" active={ts.key==='dia_atual'} dir={ts.dir} onSort={() => ts.sort('dia_atual', true)} />
+            <SortTh col="delta_7d" label="Δ7d"      active={ts.key==='delta_7d'} dir={ts.dir} onSort={() => ts.sort('delta_7d', true)} />
+            <SortTh col="maximo"   label="Máx"      active={ts.key==='maximo'}   dir={ts.dir} onSort={() => ts.sort('maximo', true)} />
+            <SortTh col="minimo"   label="Mín"      active={ts.key==='minimo'}   dir={ts.dir} onSort={() => ts.sort('minimo', true)} />
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Tendência</th>
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Sparkline</th>
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Lib</th>
           </tr>
         </thead>
         <tbody>
-          {trackerRows.map(row => (
+          {trackerOrdenados.map(row => (
             <tr key={row.id} className="border-b border-gray-800/40 hover:bg-gray-900/60">
               <td className="px-3 py-2.5 text-gray-300 max-w-[140px]">
                 <span className="truncate block">{row.anunciante ?? '—'}</span>
@@ -1050,6 +1089,12 @@ function CandidatasTab() {
     return map
   }, [trackerRows])
 
+  const cs = useSort<'nicho'|'tipo_funil'|'formato_entregavel'|'n_anuncios_ativos'|'dias_ativo_oferta'>('n_anuncios_ativos', 'desc')
+  const candidatasOrdenadas = useMemo(() => {
+    if (!candidatas) return []
+    return sortRows(candidatas, cs.key as keyof Oferta, cs.dir)
+  }, [candidatas, cs.key, cs.dir])
+
   function handleCopiarBriefing(oferta: Oferta) {
     const md = [
       `## Briefing — ${oferta.anunciante ?? '(sem nome)'}`,
@@ -1089,12 +1134,12 @@ function CandidatasTab() {
           <thead>
             <tr className="border-b border-gray-800 bg-gray-900/60">
               <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
+              <SortTh col="nicho"              label="Nicho"    active={cs.key==='nicho'}              dir={cs.dir} onSort={() => cs.sort('nicho')} />
+              <SortTh col="tipo_funil"         label="Funil"    active={cs.key==='tipo_funil'}         dir={cs.dir} onSort={() => cs.sort('tipo_funil')} />
+              <SortTh col="formato_entregavel" label="Formato"  active={cs.key==='formato_entregavel'} dir={cs.dir} onSort={() => cs.sort('formato_entregavel')} />
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Expert</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+              <SortTh col="n_anuncios_ativos"  label="Ativos"   active={cs.key==='n_anuncios_ativos'}  dir={cs.dir} onSort={() => cs.sort('n_anuncios_ativos', true)} />
+              <SortTh col="dias_ativo_oferta"  label="Dias"     active={cs.key==='dias_ativo_oferta'}  dir={cs.dir} onSort={() => cs.sort('dias_ativo_oferta', true)} />
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Δ7d</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Spark</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Observações</th>
@@ -1103,7 +1148,7 @@ function CandidatasTab() {
             </tr>
           </thead>
           <tbody>
-            {candidatas.map((o: Oferta) => {
+            {candidatasOrdenadas.map((o: Oferta) => {
               const tracker = trackerById[o.id]
               const delta = tracker?.delta_7d ?? null
               const pontos = sparklines?.[o.id] ?? []
@@ -1225,6 +1270,12 @@ function InfoappTab() {
     return ofertas.find(o => o.id === selectedOferta.id) ?? selectedOferta
   }, [selectedOferta, ofertas])
 
+  const iis = useSort<'n_anuncios_ativos'|'dias_ativo_oferta'|'nicho'|'mercado'|'preco_visivel'|'formato_entregavel'|'tipo_funil'>('n_anuncios_ativos', 'desc')
+  const ofertasOrdenadas = useMemo(() => {
+    if (!ofertas) return []
+    return sortRows(ofertas, iis.key as keyof Oferta, iis.dir)
+  }, [ofertas, iis.key, iis.dir])
+
   if (isLoading) {
     return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando...</p>
   }
@@ -1245,20 +1296,20 @@ function InfoappTab() {
             <tr className="border-b border-gray-800 bg-gray-900/60">
               <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+              <SortTh col="n_anuncios_ativos"  label="Ativos"   active={iis.key==='n_anuncios_ativos'}  dir={iis.dir} onSort={() => iis.sort('n_anuncios_ativos', true)} />
+              <SortTh col="dias_ativo_oferta"  label="Dias"     active={iis.key==='dias_ativo_oferta'}  dir={iis.dir} onSort={() => iis.sort('dias_ativo_oferta', true)} />
+              <SortTh col="nicho"              label="Nicho"    active={iis.key==='nicho'}              dir={iis.dir} onSort={() => iis.sort('nicho')} />
+              <SortTh col="mercado"            label="Mercado"  active={iis.key==='mercado'}            dir={iis.dir} onSort={() => iis.sort('mercado')} />
+              <SortTh col="preco_visivel"      label="Preço"    active={iis.key==='preco_visivel'}      dir={iis.dir} onSort={() => iis.sort('preco_visivel')} />
+              <SortTh col="formato_entregavel" label="Formato"  active={iis.key==='formato_entregavel'} dir={iis.dir} onSort={() => iis.sort('formato_entregavel')} />
+              <SortTh col="tipo_funil"         label="Funil"    active={iis.key==='tipo_funil'}         dir={iis.dir} onSort={() => iis.sort('tipo_funil')} />
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
             </tr>
           </thead>
           <tbody>
-            {ofertas.map((o: Oferta) => {
+            {ofertasOrdenadas.map((o: Oferta) => {
               const isSelected = selectedOfertaAtualizada?.id === o.id
               return (
               <tr
@@ -1365,6 +1416,12 @@ function ArquivoTab() {
     staleTime: 30_000,
   })
 
+  const arqs = useSort<'nicho'|'tipo_funil'|'formato_entregavel'|'n_anuncios_ativos'|'dias_ativo_oferta'>('dias_ativo_oferta', 'desc')
+  const ofertasOrdenadas = useMemo(() => {
+    if (!ofertas) return []
+    return sortRows(ofertas, arqs.key as keyof Oferta, arqs.dir)
+  }, [ofertas, arqs.key, arqs.dir])
+
   return (
     <div className="flex flex-col gap-3">
       {/* Header: busca + filtros de status */}
@@ -1407,18 +1464,18 @@ function ArquivoTab() {
               <thead>
                 <tr className="border-b border-gray-800 bg-gray-900/60">
                   <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+                  <SortTh col="nicho"              label="Nicho"    active={arqs.key==='nicho'}              dir={arqs.dir} onSort={() => arqs.sort('nicho')} />
+                  <SortTh col="tipo_funil"         label="Funil"    active={arqs.key==='tipo_funil'}         dir={arqs.dir} onSort={() => arqs.sort('tipo_funil')} />
+                  <SortTh col="formato_entregavel" label="Formato"  active={arqs.key==='formato_entregavel'} dir={arqs.dir} onSort={() => arqs.sort('formato_entregavel')} />
+                  <SortTh col="n_anuncios_ativos"  label="Ativos"   active={arqs.key==='n_anuncios_ativos'}  dir={arqs.dir} onSort={() => arqs.sort('n_anuncios_ativos', true)} />
+                  <SortTh col="dias_ativo_oferta"  label="Dias"     active={arqs.key==='dias_ativo_oferta'}  dir={arqs.dir} onSort={() => arqs.sort('dias_ativo_oferta', true)} />
                   <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
                   <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
                   <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
                 </tr>
               </thead>
               <tbody>
-                {ofertas.map((o: Oferta) => (
+                {ofertasOrdenadas.map((o: Oferta) => (
                   <tr key={o.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
                     <td className="px-4 py-3 max-w-[160px]">
                       <span className="truncate block text-gray-300">{o.anunciante ?? '—'}</span>
@@ -1510,6 +1567,12 @@ function RastrosTab() {
     queryFn: fetchRastros,
     enabled: true,
   })
+
+  const rrs = useSort<'grupo'|'tipo_busca'|'nicho'|'populacao_observada'|'criado_em'>('criado_em', 'desc')
+  const rastrosOrdenados = useMemo(() => {
+    if (!rastros) return []
+    return sortRows(rastros, rrs.key as any, rrs.dir)
+  }, [rastros, rrs.key, rrs.dir])
 
   // Inicializa o editState quando rastros carregam (sem sobrescrever edições ativas)
   useEffect(() => {
@@ -1726,18 +1789,18 @@ function RastrosTab() {
             <thead>
               <tr className="border-b border-gray-800 bg-gray-900/60">
                 <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Query</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Grupo</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Tipo Busca</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Nicho</th>
+                <SortTh col="grupo"                label="Grupo"       active={rrs.key==='grupo'}                dir={rrs.dir} onSort={() => rrs.sort('grupo')} />
+                <SortTh col="tipo_busca"           label="Tipo Busca"  active={rrs.key==='tipo_busca'}           dir={rrs.dir} onSort={() => rrs.sort('tipo_busca')} />
+                <SortTh col="nicho"                label="Nicho"       active={rrs.key==='nicho'}                dir={rrs.dir} onSort={() => rrs.sort('nicho')} />
                 <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Funil Hint</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Pop. observada</th>
+                <SortTh col="populacao_observada"  label="Pop. obs."   active={rrs.key==='populacao_observada'}  dir={rrs.dir} onSort={() => rrs.sort('populacao_observada', true)} />
                 <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Status</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Criado em</th>
+                <SortTh col="criado_em"            label="Criado em"   active={rrs.key==='criado_em'}            dir={rrs.dir} onSort={() => rrs.sort('criado_em')} />
                 <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Ações</th>
               </tr>
             </thead>
             <tbody>
-              {rastros.map((r: Rastro) => {
+              {rastrosOrdenados.map((r: Rastro) => {
                 const es = editState[r.id]
                 const isSemRetorno = r.status === 'sem_retorno'
                 const statusCfg = RASTRO_STATUS_CFG[r.status] ?? RASTRO_STATUS_CFG.a_testar
