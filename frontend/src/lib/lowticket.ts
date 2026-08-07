@@ -96,6 +96,7 @@ export interface Rastro {
   query: string
   grupo: RastroGrupo
   tipo_busca: 'plataforma' | 'nicho' | 'formato'
+  nicho: string | null
   funil_hint: string | null
   populacao_observada: number | null
   status: RastroStatus
@@ -391,7 +392,7 @@ export async function fetchRastros(): Promise<Rastro[]> {
  * Retorna o rastro inserido.
  */
 export async function insertRastro(
-  fields: { query: string; grupo: RastroGrupo; tipo_busca: 'plataforma' | 'nicho' | 'formato'; funil_hint?: string | null }
+  fields: { query: string; grupo: RastroGrupo; tipo_busca: 'plataforma' | 'nicho' | 'formato'; nicho?: string | null; funil_hint?: string | null }
 ): Promise<Rastro> {
   const { data, error } = await supabaseLT
     .from('rastros')
@@ -414,7 +415,7 @@ export async function insertRastro(
  */
 export async function updateRastro(
   id: string,
-  patch: Partial<Pick<Rastro, 'grupo' | 'tipo_busca' | 'funil_hint' | 'populacao_observada' | 'status'>>
+  patch: Partial<Pick<Rastro, 'grupo' | 'tipo_busca' | 'nicho' | 'funil_hint' | 'populacao_observada' | 'status'>>
 ): Promise<void> {
   const { error } = await supabaseLT
     .from('rastros')
