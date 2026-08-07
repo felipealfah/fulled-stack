@@ -570,6 +570,51 @@ function Toast({ message, onDismiss }: { message: string; onDismiss: () => void 
   )
 }
 
+// ── Helpers de ordenação (compartilhados entre todas as abas) ─────────────────
+
+function sortRows<T>(rows: T[], key: keyof T, dir: 'asc' | 'desc'): T[] {
+  return [...rows].sort((a, b) => {
+    const va = a[key]
+    const vb = b[key]
+    if (va === null || va === undefined) return 1
+    if (vb === null || vb === undefined) return -1
+    const cmp = va < vb ? -1 : va > vb ? 1 : 0
+    return dir === 'asc' ? cmp : -cmp
+  })
+}
+
+function SortTh({ col, label, sortKey, sortDir, onSort, className }: {
+  col: string; label: string; sortKey: string; sortDir: 'asc' | 'desc'
+  onSort: (col: string) => void; className?: string
+}) {
+  const active = sortKey === col
+  return (
+    <th
+      onClick={() => onSort(col)}
+      className={`px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-300 transition-colors ${className ?? ''}`}
+    >
+      {label}
+      <span className={`ml-1 ${active ? 'text-violet-400' : 'text-gray-700'}`}>
+        {active ? (sortDir === 'asc' ? '▲' : '▼') : '⇅'}
+      </span>
+    </th>
+  )
+}
+
+function useSortState<K extends string>(defaultKey: K, defaultDir: 'asc' | 'desc' = 'asc') {
+  const [sortKey, setSortKey] = useState<K>(defaultKey)
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>(defaultDir)
+  function handleSort(key: K, numericKeys: K[] = []) {
+    if (sortKey === key) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortKey(key)
+      setSortDir(numericKeys.includes(key) ? 'desc' : 'asc')
+    }
+  }
+  return { sortKey, sortDir, handleSort }
+}
+
 // ── Aba Gate ──────────────────────────────────────────────────────────────────
 
 type GateSortKey = 'n_anuncios_ativos' | 'dias_ativo_oferta' | 'nicho' | 'mercado' | 'preco_visivel' | 'formato_entregavel' | 'tipo_funil'
@@ -697,19 +742,13 @@ function GateTab() {
               <tr className="border-b border-gray-800 bg-gray-900/60">
                 <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-                {(['n_anuncios_ativos', 'dias_ativo_oferta', 'nicho', 'mercado', 'preco_visivel', 'formato_entregavel', 'tipo_funil'] as GateSortKey[]).map((col, i) => {
-                  const labels: Record<GateSortKey, string> = { n_anuncios_ativos: 'Ativos', dias_ativo_oferta: 'Dias', nicho: 'Nicho', mercado: 'Mercado', preco_visivel: 'Preço', formato_entregavel: 'Formato', tipo_funil: 'Funil' }
-                  const active = sortKey === col
-                  return (
-                    <th key={i} onClick={() => handleSort(col)}
-                      className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-300 transition-colors">
-                      {labels[col]}
-                      <span className={`ml-1 ${active ? 'text-violet-400' : 'text-gray-700'}`}>
-                        {active ? (sortDir === 'asc' ? '▲' : '▼') : '⇅'}
-                      </span>
-                    </th>
-                  )
-                })}
+                <SortTh col="n_anuncios_ativos" label="Ativos"   sortKey={sortKey} sortDir={sortDir} onSort={k => handleSort(k as GateSortKey, ['n_anuncios_ativos','dias_ativo_oferta'])} />
+                <SortTh col="dias_ativo_oferta" label="Dias"    sortKey={sortKey} sortDir={sortDir} onSort={k => handleSort(k as GateSortKey, ['n_anuncios_ativos','dias_ativo_oferta'])} />
+                <SortTh col="nicho"              label="Nicho"   sortKey={sortKey} sortDir={sortDir} onSort={k => handleSort(k as GateSortKey, ['n_anuncios_ativos','dias_ativo_oferta'])} />
+                <SortTh col="mercado"            label="Mercado" sortKey={sortKey} sortDir={sortDir} onSort={k => handleSort(k as GateSortKey, ['n_anuncios_ativos','dias_ativo_oferta'])} />
+                <SortTh col="preco_visivel"      label="Preço"   sortKey={sortKey} sortDir={sortDir} onSort={k => handleSort(k as GateSortKey, ['n_anuncios_ativos','dias_ativo_oferta'])} />
+                <SortTh col="formato_entregavel" label="Formato" sortKey={sortKey} sortDir={sortDir} onSort={k => handleSort(k as GateSortKey, ['n_anuncios_ativos','dias_ativo_oferta'])} />
+                <SortTh col="tipo_funil"         label="Funil"   sortKey={sortKey} sortDir={sortDir} onSort={k => handleSort(k as GateSortKey, ['n_anuncios_ativos','dias_ativo_oferta'])} />
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
@@ -880,14 +919,23 @@ function SparklineSVG({ points }: { points: ObservacaoDiaria[] }) {
 
 // ── Aba Tracker ───────────────────────────────────────────────────────────────
 
+type TrackerSortKey = 'nicho' | 'tipo_funil' | 'data_inicio_monitoramento' | 'dia_1' | 'dia_atual' | 'delta_7d' | 'maximo' | 'minimo'
+const TRACKER_NUM_KEYS: TrackerSortKey[] = ['dia_1', 'dia_atual', 'delta_7d', 'maximo', 'minimo']
+
 function TrackerTab() {
   const queryClient = useQueryClient()
+  const { sortKey: tSortKey, sortDir: tSortDir, handleSort: tHandleSort } = useSortState<TrackerSortKey>('dia_atual', 'desc')
 
   const { data: trackerRows, isLoading: loadingTracker, error: errorTracker } = useQuery({
     queryKey: ['lt-tracker'],
     queryFn: fetchTracker,
     staleTime: 30_000,
   })
+
+  const trackerOrdenados = useMemo(
+    () => sortRows(trackerRows ?? [], tSortKey as keyof typeof trackerRows[0], tSortDir),
+    [trackerRows, tSortKey, tSortDir]
+  )
 
   const trackerIds = useMemo(() => (trackerRows ?? []).map(r => r.id), [trackerRows])
 
@@ -940,23 +988,23 @@ function TrackerTab() {
         <thead>
           <tr className="border-b border-gray-800 bg-gray-900/60">
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Anunciante</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Nicho</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Funil</th>
+            <SortTh col="nicho"                    label="Nicho"    sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
+            <SortTh col="tipo_funil"               label="Funil"    sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Expert</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Início</th>
+            <SortTh col="data_inicio_monitoramento" label="Início"  sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Status</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Dia 1</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Dia atual</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Δ7d</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Máx</th>
-            <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Mín</th>
+            <SortTh col="dia_1"    label="Dia 1"    sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
+            <SortTh col="dia_atual" label="Dia atual" sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
+            <SortTh col="delta_7d" label="Δ7d"      sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
+            <SortTh col="maximo"   label="Máx"      sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
+            <SortTh col="minimo"   label="Mín"      sortKey={tSortKey} sortDir={tSortDir} onSort={k => tHandleSort(k as TrackerSortKey, TRACKER_NUM_KEYS)} />
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Tendência</th>
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Sparkline</th>
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Lib</th>
           </tr>
         </thead>
         <tbody>
-          {trackerRows.map(row => (
+          {trackerOrdenados.map(row => (
             <tr key={row.id} className="border-b border-gray-800/40 hover:bg-gray-900/60">
               <td className="px-3 py-2.5 text-gray-300 max-w-[140px]">
                 <span className="truncate block">{row.anunciante ?? '—'}</span>
@@ -1029,7 +1077,7 @@ function TrackerTab() {
         </tbody>
       </table>
       <p className="text-xs font-mono text-gray-700 px-3 py-2">
-        {trackerRows.length} oferta{trackerRows.length !== 1 ? 's' : ''} em monitoramento
+        {trackerOrdenados.length} oferta{trackerOrdenados.length !== 1 ? 's' : ''} em monitoramento
       </p>
     </div>
   )
@@ -1037,9 +1085,13 @@ function TrackerTab() {
 
 // ── Aba Candidatas (FR-5) ─────────────────────────────────────────────────────
 
+type CandSortKey = 'nicho' | 'tipo_funil' | 'formato_entregavel' | 'n_anuncios_ativos' | 'dias_ativo_oferta'
+const CAND_NUM_KEYS: CandSortKey[] = ['n_anuncios_ativos', 'dias_ativo_oferta']
+
 function CandidatasTab() {
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
+  const { sortKey: cSortKey, sortDir: cSortDir, handleSort: cHandleSort } = useSortState<CandSortKey>('n_anuncios_ativos', 'desc')
 
   const { data: candidatas, isLoading, error } = useQuery({
     queryKey: ['lt-candidatas'],
@@ -1071,6 +1123,11 @@ function CandidatasTab() {
     staleTime: 60_000,
     enabled: candidataIds.length > 0,
   })
+
+  const candidatasOrdenadas = useMemo(
+    () => sortRows(candidatas ?? [], cSortKey as keyof Oferta, cSortDir),
+    [candidatas, cSortKey, cSortDir]
+  )
 
   // Join em memória: TrackerRow por id para acessar delta_7d e tendencia
   const trackerById = useMemo(() => {
@@ -1120,12 +1177,12 @@ function CandidatasTab() {
           <thead>
             <tr className="border-b border-gray-800 bg-gray-900/60">
               <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
+              <SortTh col="nicho"              label="Nicho"   sortKey={cSortKey} sortDir={cSortDir} onSort={k => cHandleSort(k as CandSortKey, CAND_NUM_KEYS)} />
+              <SortTh col="tipo_funil"         label="Funil"   sortKey={cSortKey} sortDir={cSortDir} onSort={k => cHandleSort(k as CandSortKey, CAND_NUM_KEYS)} />
+              <SortTh col="formato_entregavel" label="Formato" sortKey={cSortKey} sortDir={cSortDir} onSort={k => cHandleSort(k as CandSortKey, CAND_NUM_KEYS)} />
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Expert</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+              <SortTh col="n_anuncios_ativos"  label="Ativos"  sortKey={cSortKey} sortDir={cSortDir} onSort={k => cHandleSort(k as CandSortKey, CAND_NUM_KEYS)} />
+              <SortTh col="dias_ativo_oferta"  label="Dias"    sortKey={cSortKey} sortDir={cSortDir} onSort={k => cHandleSort(k as CandSortKey, CAND_NUM_KEYS)} />
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Δ7d</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Spark</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Observações</th>
@@ -1134,7 +1191,7 @@ function CandidatasTab() {
             </tr>
           </thead>
           <tbody>
-            {candidatas.map((o: Oferta) => {
+            {candidatasOrdenadas.map((o: Oferta) => {
               const tracker = trackerById[o.id]
               const delta = tracker?.delta_7d ?? null
               const pontos = sparklines?.[o.id] ?? []
@@ -1233,7 +1290,7 @@ function CandidatasTab() {
       )}
       </div>
       <p className="text-xs font-mono text-gray-700">
-        {candidatas.length} candidata{candidatas.length !== 1 ? 's' : ''}
+        {candidatasOrdenadas.length} candidata{candidatasOrdenadas.length !== 1 ? 's' : ''}
       </p>
     </div>
   )
@@ -1241,14 +1298,23 @@ function CandidatasTab() {
 
 // ── Aba Infoapp (FR-6) ────────────────────────────────────────────────────────
 
+type InfoSortKey = 'n_anuncios_ativos' | 'dias_ativo_oferta' | 'nicho' | 'mercado' | 'preco_visivel' | 'formato_entregavel' | 'tipo_funil'
+const INFO_NUM_KEYS: InfoSortKey[] = ['n_anuncios_ativos', 'dias_ativo_oferta']
+
 function InfoappTab() {
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
+  const { sortKey: iSortKey, sortDir: iSortDir, handleSort: iHandleSort } = useSortState<InfoSortKey>('n_anuncios_ativos', 'desc')
 
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-infoapp'],
     queryFn: fetchInfoapp,
     staleTime: 30_000,
   })
+
+  const ofertasOrdenadas = useMemo(
+    () => sortRows(ofertas ?? [], iSortKey as keyof Oferta, iSortDir),
+    [ofertas, iSortKey, iSortDir]
+  )
 
   // Manter selecionada sincronizada com dados atualizados
   const selectedOfertaAtualizada = useMemo(() => {
@@ -1276,20 +1342,20 @@ function InfoappTab() {
             <tr className="border-b border-gray-800 bg-gray-900/60">
               <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+              <SortTh col="n_anuncios_ativos"  label="Ativos"   sortKey={iSortKey} sortDir={iSortDir} onSort={k => iHandleSort(k as InfoSortKey, INFO_NUM_KEYS)} />
+              <SortTh col="dias_ativo_oferta"  label="Dias"     sortKey={iSortKey} sortDir={iSortDir} onSort={k => iHandleSort(k as InfoSortKey, INFO_NUM_KEYS)} />
+              <SortTh col="nicho"              label="Nicho"    sortKey={iSortKey} sortDir={iSortDir} onSort={k => iHandleSort(k as InfoSortKey, INFO_NUM_KEYS)} />
+              <SortTh col="mercado"            label="Mercado"  sortKey={iSortKey} sortDir={iSortDir} onSort={k => iHandleSort(k as InfoSortKey, INFO_NUM_KEYS)} />
+              <SortTh col="preco_visivel"      label="Preço"    sortKey={iSortKey} sortDir={iSortDir} onSort={k => iHandleSort(k as InfoSortKey, INFO_NUM_KEYS)} />
+              <SortTh col="formato_entregavel" label="Formato"  sortKey={iSortKey} sortDir={iSortDir} onSort={k => iHandleSort(k as InfoSortKey, INFO_NUM_KEYS)} />
+              <SortTh col="tipo_funil"         label="Funil"    sortKey={iSortKey} sortDir={iSortDir} onSort={k => iHandleSort(k as InfoSortKey, INFO_NUM_KEYS)} />
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
             </tr>
           </thead>
           <tbody>
-            {ofertas.map((o: Oferta) => {
+            {ofertasOrdenadas.map((o: Oferta) => {
               const isSelected = selectedOfertaAtualizada?.id === o.id
               return (
               <tr
@@ -1361,7 +1427,7 @@ function InfoappTab() {
       )}
       </div>
       <p className="text-xs font-mono text-gray-700">
-        {ofertas.length} oferta{ofertas.length !== 1 ? 's' : ''} infoapp
+        {ofertasOrdenadas.length} oferta{ofertasOrdenadas.length !== 1 ? 's' : ''} infoapp
       </p>
     </div>
   )
@@ -1376,10 +1442,14 @@ const ARQUIVO_STATUS_OPTS: Array<{ value: OfertaStatus | ''; label: string }> = 
   { value: 'pausada', label: 'Pausada' },
 ]
 
+type ArqSortKey = 'nicho' | 'tipo_funil' | 'formato_entregavel' | 'n_anuncios_ativos' | 'dias_ativo_oferta' | 'atualizado_em'
+const ARQ_NUM_KEYS: ArqSortKey[] = ['n_anuncios_ativos', 'dias_ativo_oferta']
+
 function ArquivoTab() {
   const [arquivoBusca, setArquivoBusca] = useState('')
   const [arquivoBuscaDebounced, setArquivoBuscaDebounced] = useState('')
   const [arquivoStatus, setArquivoStatus] = useState<OfertaStatus | ''>('')
+  const { sortKey: aSortKey, sortDir: aSortDir, handleSort: aHandleSort } = useSortState<ArqSortKey>('atualizado_em', 'desc')
 
   // Debounce 300ms para não disparar query a cada tecla
   useEffect(() => {
@@ -1438,18 +1508,18 @@ function ArquivoTab() {
               <thead>
                 <tr className="border-b border-gray-800 bg-gray-900/60">
                   <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
+                  <SortTh col="nicho"              label="Nicho"      sortKey={aSortKey} sortDir={aSortDir} onSort={k => aHandleSort(k as ArqSortKey, ARQ_NUM_KEYS)} />
+                  <SortTh col="tipo_funil"         label="Funil"      sortKey={aSortKey} sortDir={aSortDir} onSort={k => aHandleSort(k as ArqSortKey, ARQ_NUM_KEYS)} />
+                  <SortTh col="formato_entregavel" label="Formato"    sortKey={aSortKey} sortDir={aSortDir} onSort={k => aHandleSort(k as ArqSortKey, ARQ_NUM_KEYS)} />
+                  <SortTh col="n_anuncios_ativos"  label="Ativos"     sortKey={aSortKey} sortDir={aSortDir} onSort={k => aHandleSort(k as ArqSortKey, ARQ_NUM_KEYS)} />
+                  <SortTh col="dias_ativo_oferta"  label="Dias"       sortKey={aSortKey} sortDir={aSortDir} onSort={k => aHandleSort(k as ArqSortKey, ARQ_NUM_KEYS)} />
                   <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
-                  <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
+                  <SortTh col="atualizado_em"      label="Atualizado" sortKey={aSortKey} sortDir={aSortDir} onSort={k => aHandleSort(k as ArqSortKey, ARQ_NUM_KEYS)} />
                   <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
                 </tr>
               </thead>
               <tbody>
-                {ofertas.map((o: Oferta) => (
+                {sortRows(ofertas, aSortKey as keyof Oferta, aSortDir).map((o: Oferta) => (
                   <tr key={o.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
                     <td className="px-4 py-3 max-w-[160px]">
                       <span className="truncate block text-gray-300">{o.anunciante ?? '—'}</span>
@@ -1532,6 +1602,7 @@ function RastrosTab() {
 
   // Estado de edição inline por linha (rastroId → estado editado)
   const [editState, setEditState] = useState<Record<string, RastroEditState>>({})
+  const { sortKey: rSortKey, sortDir: rSortDir, handleSort: rHandleSort } = useSortState<keyof Rastro>('criado_em', 'desc')
 
   // Query principal
   const { data: rastros, isLoading: loadingRastros, error: errorRastros } = useQuery({
@@ -1539,6 +1610,11 @@ function RastrosTab() {
     queryFn: fetchRastros,
     enabled: true,
   })
+
+  const rastrosOrdenados = useMemo(
+    () => sortRows(rastros ?? [], rSortKey, rSortDir),
+    [rastros, rSortKey, rSortDir]
+  )
 
   // Inicializa o editState quando rastros carregam (sem sobrescrever edições ativas)
   useEffect(() => {
@@ -1740,18 +1816,18 @@ function RastrosTab() {
           <table className="w-full text-xs font-mono">
             <thead>
               <tr className="border-b border-gray-800 bg-gray-900/60">
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Query</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Grupo</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Tipo Busca</th>
+                <SortTh col="query"      label="Query"        sortKey={rSortKey as string} sortDir={rSortDir} onSort={k => rHandleSort(k as keyof Rastro)} />
+                <SortTh col="grupo"      label="Grupo"        sortKey={rSortKey as string} sortDir={rSortDir} onSort={k => rHandleSort(k as keyof Rastro)} />
+                <SortTh col="tipo_busca" label="Tipo Busca"   sortKey={rSortKey as string} sortDir={rSortDir} onSort={k => rHandleSort(k as keyof Rastro)} />
                 <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Funil Hint</th>
                 <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Pop. observada</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Status</th>
-                <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Criado em</th>
+                <SortTh col="status"     label="Status"       sortKey={rSortKey as string} sortDir={rSortDir} onSort={k => rHandleSort(k as keyof Rastro)} />
+                <SortTh col="criado_em"  label="Criado em"    sortKey={rSortKey as string} sortDir={rSortDir} onSort={k => rHandleSort(k as keyof Rastro)} />
                 <th className="text-gray-500 text-left px-3 py-2 font-normal whitespace-nowrap">Ações</th>
               </tr>
             </thead>
             <tbody>
-              {rastros.map((r: Rastro) => {
+              {rastrosOrdenados.map((r: Rastro) => {
                 const es = editState[r.id]
                 const isSemRetorno = r.status === 'sem_retorno'
                 const statusCfg = RASTRO_STATUS_CFG[r.status] ?? RASTRO_STATUS_CFG.a_testar
