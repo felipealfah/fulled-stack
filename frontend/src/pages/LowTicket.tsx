@@ -572,11 +572,15 @@ function Toast({ message, onDismiss }: { message: string; onDismiss: () => void 
 
 // ── Aba Gate ──────────────────────────────────────────────────────────────────
 
+type GateSortKey = 'n_anuncios_ativos' | 'dias_ativo_oferta' | 'nicho' | 'mercado' | 'preco_visivel' | 'formato_entregavel' | 'tipo_funil'
+
 function GateTab() {
   const [filtroMercado, setFiltroMercado] = useState<string>('')
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
   const [showManualForm, setShowManualForm] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
+  const [sortKey, setSortKey] = useState<GateSortKey>('n_anuncios_ativos')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-gate'],
@@ -600,6 +604,27 @@ function GateTab() {
     if (!filtroMercado) return ofertas
     return ofertas.filter(o => o.mercado === filtroMercado)
   }, [ofertas, filtroMercado])
+
+  // Ordenação client-side
+  const ofertasOrdenadas = useMemo(() => {
+    return [...ofertasFiltradas].sort((a, b) => {
+      const va = a[sortKey]
+      const vb = b[sortKey]
+      if (va === null || va === undefined) return 1
+      if (vb === null || vb === undefined) return -1
+      const cmp = va < vb ? -1 : va > vb ? 1 : 0
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [ofertasFiltradas, sortKey, sortDir])
+
+  function handleSort(key: GateSortKey) {
+    if (sortKey === key) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortKey(key)
+      setSortDir(['n_anuncios_ativos', 'dias_ativo_oferta'].includes(key) ? 'desc' : 'asc')
+    }
+  }
 
   // Manter selectedOferta sincronizada com dados atualizados
   const selectedOfertaAtualizada = useMemo(() => {
@@ -672,27 +697,33 @@ function GateTab() {
               <tr className="border-b border-gray-800 bg-gray-900/60">
                 <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+                {(['n_anuncios_ativos', 'dias_ativo_oferta', 'nicho', 'mercado', 'preco_visivel', 'formato_entregavel', 'tipo_funil'] as GateSortKey[]).map((col, i) => {
+                  const labels: Record<GateSortKey, string> = { n_anuncios_ativos: 'Ativos', dias_ativo_oferta: 'Dias', nicho: 'Nicho', mercado: 'Mercado', preco_visivel: 'Preço', formato_entregavel: 'Formato', tipo_funil: 'Funil' }
+                  const active = sortKey === col
+                  return (
+                    <th key={i} onClick={() => handleSort(col)}
+                      className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-300 transition-colors">
+                      {labels[col]}
+                      <span className={`ml-1 ${active ? 'text-violet-400' : 'text-gray-700'}`}>
+                        {active ? (sortDir === 'asc' ? '▲' : '▼') : '⇅'}
+                      </span>
+                    </th>
+                  )
+                })}
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
               </tr>
             </thead>
             <tbody>
-              {ofertasFiltradas.length === 0 && (
+              {ofertasOrdenadas.length === 0 && (
                 <tr>
                   <td colSpan={12} className="px-4 py-12 text-center text-gray-600 text-sm">
                     Nenhuma oferta no Gate
                   </td>
                 </tr>
               )}
-              {ofertasFiltradas.map((o: Oferta) => {
+              {ofertasOrdenadas.map((o: Oferta) => {
                 const isSelected = selectedOferta?.id === o.id
                 return (
                   <tr
@@ -800,7 +831,7 @@ function GateTab() {
       </div>
 
       <p className="text-xs font-mono text-gray-700">
-        {ofertasFiltradas.length} oferta{ofertasFiltradas.length !== 1 ? 's' : ''} no gate
+        {ofertasOrdenadas.length} oferta{ofertasOrdenadas.length !== 1 ? 's' : ''} no gate
         {filtroMercado ? ` · mercado: ${filtroMercado}` : ''}
       </p>
 
