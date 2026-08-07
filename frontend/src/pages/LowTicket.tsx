@@ -1642,9 +1642,6 @@ function RastrosTab() {
     })
   }
 
-  // Verificar se há rastros de nicho (aviso global)
-  const temNicho = (rastros ?? []).some(r => r.tipo_busca === 'nicho')
-
   const labelCls = 'text-xs font-mono text-gray-500 mb-1 block'
   const inputCls = 'w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-100 focus:outline-none focus:border-violet-500'
   const inlineInputCls = 'bg-transparent border-b border-gray-700 text-xs font-mono text-gray-300 focus:border-violet-500 outline-none w-full'
@@ -1663,11 +1660,9 @@ function RastrosTab() {
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h2 className="text-sm font-mono font-semibold text-gray-100">Catálogo de Rastros</h2>
-          {temNicho && (
-            <p className="text-xs font-mono text-gray-600 mt-1">
-              plataforma roda no Flow 1 (domingo) · nicho e formato rodam no Flow 3 (seg/qua/sex)
-            </p>
-          )}
+          <p className="text-xs font-mono text-gray-600 mt-1">
+            plataforma roda no Flow 1 (domingo) · nicho e formato rodam no Flow 3 (seg/qua/sex)
+          </p>
         </div>
         <button
           onClick={() => setShowForm(true)}
