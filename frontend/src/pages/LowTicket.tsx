@@ -572,11 +572,18 @@ function Toast({ message, onDismiss }: { message: string; onDismiss: () => void 
 
 // ── Aba Gate ──────────────────────────────────────────────────────────────────
 
+type GateSortKey = 'n_anuncios_ativos' | 'dias_ativo_oferta' | 'nicho' | 'mercado' | 'preco_visivel' | 'formato_entregavel' | 'tipo_funil'
+
 function GateTab() {
   const [filtroMercado, setFiltroMercado] = useState<string>('')
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
   const [showManualForm, setShowManualForm] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
+  const [sortKey, setSortKey] = useState<GateSortKey>('n_anuncios_ativos')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [showBulkConfirm, setShowBulkConfirm] = useState(false)
+  const queryClient = useQueryClient()
 
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-gate'],
@@ -601,14 +608,79 @@ function GateTab() {
     return ofertas.filter(o => o.mercado === filtroMercado)
   }, [ofertas, filtroMercado])
 
+  // Ordenação client-side
+  const ofertasOrdenadas = useMemo(() => {
+    return [...ofertasFiltradas].sort((a, b) => {
+      const va = a[sortKey]
+      const vb = b[sortKey]
+      if (va === null || va === undefined) return 1
+      if (vb === null || vb === undefined) return -1
+      const cmp = va < vb ? -1 : va > vb ? 1 : 0
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [ofertasFiltradas, sortKey, sortDir])
+
   // Manter selectedOferta sincronizada com dados atualizados
   const selectedOfertaAtualizada = useMemo(() => {
     if (!selectedOferta || !ofertas) return selectedOferta
     return ofertas.find(o => o.id === selectedOferta.id) ?? selectedOferta
   }, [selectedOferta, ofertas])
 
+  // Multi-select helpers
+  const allIds = ofertasOrdenadas.map(o => o.id)
+  const allChecked = allIds.length > 0 && allIds.every(id => selectedIds.has(id))
+  const someChecked = !allChecked && allIds.some(id => selectedIds.has(id))
+
+  function toggleAll() {
+    setSelectedIds(allChecked ? new Set() : new Set(allIds))
+  }
+  function toggleOne(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  // Ordenação: clicar na mesma coluna inverte; coluna nova → desc (numérico) ou asc (texto)
+  function handleSort(key: GateSortKey) {
+    if (sortKey === key) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortKey(key)
+      const numericKeys: GateSortKey[] = ['n_anuncios_ativos', 'dias_ativo_oferta']
+      setSortDir(numericKeys.includes(key) ? 'desc' : 'asc')
+    }
+  }
+
+  // Bulk descartar
+  const bulkDescartar = useMutation({
+    mutationFn: () => Promise.all([...selectedIds].map(id => updateOferta(id, { status: 'descartada' }))),
+    onSuccess: () => {
+      if (selectedOferta && selectedIds.has(selectedOferta.id)) setSelectedOferta(null)
+      setSelectedIds(new Set())
+      setShowBulkConfirm(false)
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+    },
+  })
+
   function handleRowClick(o: Oferta) {
     setSelectedOferta(prev => (prev?.id === o.id ? null : o))
+  }
+
+  // Helper: cabeçalho de coluna ordenável
+  function SortTh({ col, children, className }: { col: GateSortKey; children: React.ReactNode; className?: string }) {
+    const active = sortKey === col
+    return (
+      <th className={`px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap cursor-pointer select-none hover:text-gray-300 transition-colors ${className ?? ''}`}
+        onClick={() => handleSort(col)}>
+        {children}
+        <span className={`ml-1 ${active ? 'text-violet-400' : 'text-gray-700'}`}>
+          {active ? (sortDir === 'asc' ? '▲' : '▼') : '⇅'}
+        </span>
+      </th>
+    )
   }
 
   if (isLoading) {
@@ -670,37 +742,57 @@ function GateTab() {
           <table className="w-full text-sm font-mono">
             <thead>
               <tr className="border-b border-gray-800 bg-gray-900/60">
+                {/* Checkbox select-all */}
+                <th className="px-3 py-3 w-8">
+                  <input
+                    type="checkbox"
+                    checked={allChecked}
+                    ref={el => { if (el) el.indeterminate = someChecked }}
+                    onChange={toggleAll}
+                    className="accent-violet-500 cursor-pointer"
+                  />
+                </th>
                 <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ativos</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Dias</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Nicho</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Mercado</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Preço</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Formato</th>
-                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Funil</th>
+                <SortTh col="n_anuncios_ativos">Ativos</SortTh>
+                <SortTh col="dias_ativo_oferta">Dias</SortTh>
+                <SortTh col="nicho">Nicho</SortTh>
+                <SortTh col="mercado">Mercado</SortTh>
+                <SortTh col="preco_visivel">Preço</SortTh>
+                <SortTh col="formato_entregavel">Formato</SortTh>
+                <SortTh col="tipo_funil">Funil</SortTh>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
               </tr>
             </thead>
             <tbody>
-              {ofertasFiltradas.length === 0 && (
+              {ofertasOrdenadas.length === 0 && (
                 <tr>
-                  <td colSpan={12} className="px-4 py-12 text-center text-gray-600 text-sm">
+                  <td colSpan={13} className="px-4 py-12 text-center text-gray-600 text-sm">
                     Nenhuma oferta no Gate
                   </td>
                 </tr>
               )}
-              {ofertasFiltradas.map((o: Oferta) => {
+              {ofertasOrdenadas.map((o: Oferta) => {
                 const isSelected = selectedOferta?.id === o.id
+                const isChecked = selectedIds.has(o.id)
                 return (
                   <tr
                     key={o.id}
                     className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors ${
                       isSelected ? 'bg-violet-500/5 border-l-2 border-l-violet-500' : ''
-                    }`}
+                    } ${isChecked && !isSelected ? 'bg-red-500/5' : ''}`}
                   >
+                    {/* Checkbox individual */}
+                    <td className="px-3 py-3 w-8">
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => toggleOne(o.id)}
+                        className="accent-violet-500 cursor-pointer"
+                      />
+                    </td>
                     {/* Anunciante — clicável */}
                     <td className="px-4 py-3 max-w-[160px]">
                       <button
@@ -799,10 +891,60 @@ function GateTab() {
         )}
       </div>
 
+      {/* Bulk action bar */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-gray-900 border border-red-800/40">
+          <span className="text-xs font-mono text-gray-400">
+            {selectedIds.size} oferta{selectedIds.size !== 1 ? 's' : ''} selecionada{selectedIds.size !== 1 ? 's' : ''}
+          </span>
+          <button
+            onClick={() => setShowBulkConfirm(true)}
+            className="text-xs font-mono px-3 py-1.5 rounded-lg bg-red-700/80 hover:bg-red-700 text-white transition-colors"
+          >
+            Descartar selecionadas
+          </button>
+          <button
+            onClick={() => setSelectedIds(new Set())}
+            className="text-xs font-mono text-gray-600 hover:text-gray-400 transition-colors ml-auto"
+          >
+            Limpar seleção
+          </button>
+        </div>
+      )}
+
       <p className="text-xs font-mono text-gray-700">
-        {ofertasFiltradas.length} oferta{ofertasFiltradas.length !== 1 ? 's' : ''} no gate
+        {ofertasOrdenadas.length} oferta{ofertasOrdenadas.length !== 1 ? 's' : ''} no gate
         {filtroMercado ? ` · mercado: ${filtroMercado}` : ''}
       </p>
+
+      {/* Confirm dialog bulk descartar */}
+      {showBulkConfirm && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-80 flex flex-col gap-4">
+            <p className="text-sm font-mono text-gray-200">
+              Descartar <span className="text-red-400 font-bold">{selectedIds.size}</span> oferta{selectedIds.size !== 1 ? 's' : ''}? Esta ação não pode ser desfeita pela UI.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => bulkDescartar.mutate()}
+                disabled={bulkDescartar.isPending}
+                className="flex-1 bg-red-700/80 hover:bg-red-700 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {bulkDescartar.isPending ? 'Descartando...' : 'Confirmar'}
+              </button>
+              <button
+                onClick={() => setShowBulkConfirm(false)}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+              >
+                Cancelar
+              </button>
+            </div>
+            {bulkDescartar.isError && (
+              <p className="text-red-400 text-xs font-mono">{(bulkDescartar.error as Error).message}</p>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Modal oferta manual */}
       {showManualForm && (
