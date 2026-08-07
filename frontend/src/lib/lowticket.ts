@@ -30,7 +30,7 @@ export type FormatoEntregavel =
   | 'fisico'
   | 'outro'
 
-export type RastroGrupo = 'builder' | 'checkout' | 'resposta_direta' | 'nicho'
+export type RastroGrupo = 'builder' | 'checkout' | 'resposta_direta' | 'nicho' | 'formato'
 
 export type RastroStatus = 'a_testar' | 'testado' | 'sem_retorno'
 
@@ -95,7 +95,7 @@ export interface Rastro {
   id: string
   query: string
   grupo: RastroGrupo
-  tipo_busca: 'plataforma' | 'nicho'
+  tipo_busca: 'plataforma' | 'nicho' | 'formato'
   funil_hint: string | null
   populacao_observada: number | null
   status: RastroStatus
@@ -391,7 +391,7 @@ export async function fetchRastros(): Promise<Rastro[]> {
  * Retorna o rastro inserido.
  */
 export async function insertRastro(
-  fields: { query: string; grupo: RastroGrupo; tipo_busca: 'plataforma' | 'nicho'; funil_hint?: string | null }
+  fields: { query: string; grupo: RastroGrupo; tipo_busca: 'plataforma' | 'nicho' | 'formato'; funil_hint?: string | null }
 ): Promise<Rastro> {
   const { data, error } = await supabaseLT
     .from('rastros')
