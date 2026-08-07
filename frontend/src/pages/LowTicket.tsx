@@ -582,7 +582,7 @@ function sortRows<T>(rows: T[], key: keyof T, dir: 'asc' | 'desc'): T[] {
   })
 }
 
-function SortTh({ col, label, active, dir, onSort }: {
+function SortTh({ col: _col, label, active, dir, onSort }: {
   col: string; label: string; active: boolean; dir: 'asc' | 'desc'; onSort: () => void
 }) {
   return (
