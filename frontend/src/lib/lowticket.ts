@@ -19,11 +19,12 @@ export type OfertaStatus =
   | 'pausada'
   | 'candidata'
 
-export type TipoFunil = 'Quiz' | 'Quiz + PV' | 'Quiz + VSL' | 'VSL' | 'PV + VSL' | 'PV'
+export type TipoFunil = 'Quiz' | 'Quiz + PV' | 'Quiz + VSL' | 'VSL' | 'PV + VSL' | 'PV' | 'Checkout'
 
 export type FormatoEntregavel =
   | 'educacao'
   | 'ferramenta'
+  | 'pack'
   | 'servico'
   | 'comunidade'
   | 'fisico'
@@ -357,6 +358,18 @@ export async function fetchSparklines(
 }
 
 // ── Helpers de Rastros (FR-10) ────────────────────────────────────────────────
+
+/**
+ * Retorna a contagem total de rastros (todos os status) para o card do header.
+ */
+export async function fetchRastrosCount(): Promise<number> {
+  const { count, error } = await supabaseLT
+    .from('rastros')
+    .select('*', { count: 'exact', head: true })
+
+  if (error) throw error
+  return count ?? 0
+}
 
 /**
  * Retorna todos os rastros ordenados por criado_em DESC.

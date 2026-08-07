@@ -4,6 +4,7 @@ import {
   fetchOfertasCounts,
   fetchGate,
   fetchAtualizadoEm,
+  fetchRastrosCount,
   fetchOfertaByPageId,
   fetchTracker,
   fetchSparklines,
@@ -71,8 +72,8 @@ function StatusChip({ status }: { status: OfertaStatus }) {
 
 // ── Painel de análise lateral ─────────────────────────────────────────────────
 
-const TIPO_FUNIL_OPTS: Array<TipoFunil | ''> = ['', 'Quiz', 'Quiz + PV', 'Quiz + VSL', 'VSL', 'PV + VSL', 'PV']
-const FORMATO_OPTS: Array<FormatoEntregavel | ''> = ['', 'educacao', 'ferramenta', 'servico', 'comunidade', 'fisico', 'outro']
+const TIPO_FUNIL_OPTS: Array<TipoFunil | ''> = ['', 'Quiz', 'Quiz + PV', 'Quiz + VSL', 'VSL', 'PV + VSL', 'PV', 'Checkout']
+const FORMATO_OPTS: Array<FormatoEntregavel | ''> = ['', 'educacao', 'ferramenta', 'pack', 'servico', 'comunidade', 'fisico', 'outro']
 
 interface PainelAnaliseProps {
   oferta: Oferta
@@ -121,6 +122,8 @@ function PainelAnalise({ oferta, onClose, onSaved }: PainelAnaliseProps) {
       setSaveError(null)
       queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
       onSaved()
     },
     onError: (err: Error) => {
@@ -139,6 +142,8 @@ function PainelAnalise({ oferta, onClose, onSaved }: PainelAnaliseProps) {
       queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
       queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
       setConfirmDialog(null)
       onClose()
     },
@@ -152,6 +157,8 @@ function PainelAnalise({ oferta, onClose, onSaved }: PainelAnaliseProps) {
       queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
       queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
       setConfirmDialog(null)
       onClose()
     },
@@ -1001,12 +1008,19 @@ function TrackerTab() {
 
 function CandidatasTab() {
   const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
 
   const { data: candidatas, isLoading, error } = useQuery({
     queryKey: ['lt-candidatas'],
     queryFn: fetchCandidatas,
     staleTime: 30_000,
   })
+
+  // Manter selecionada sincronizada com dados atualizados
+  const selectedOfertaAtualizada = useMemo(() => {
+    if (!selectedOferta || !candidatas) return selectedOferta
+    return candidatas.find(o => o.id === selectedOferta.id) ?? selectedOferta
+  }, [selectedOferta, candidatas])
 
   const { data: trackerRows } = useQuery({
     queryKey: ['lt-candidatas-tracker'],
@@ -1068,7 +1082,9 @@ function CandidatasTab() {
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="overflow-x-auto rounded-xl border border-gray-800">
+      {/* Layout: tabela + painel */}
+      <div className={selectedOfertaAtualizada ? 'flex gap-4 items-start' : ''}>
+      <div className={`overflow-x-auto rounded-xl border border-gray-800 ${selectedOfertaAtualizada ? 'flex-1 min-w-0' : ''}`}>
         <table className="w-full text-sm font-mono">
           <thead>
             <tr className="border-b border-gray-800 bg-gray-900/60">
@@ -1102,13 +1118,22 @@ function CandidatasTab() {
                 <span className="text-gray-500">0</span>
               )
 
+              const isSelected = selectedOfertaAtualizada?.id === o.id
               return (
-                <tr key={o.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
+                <tr
+                  key={o.id}
+                  className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors ${
+                    isSelected ? 'bg-violet-500/5 border-l-2 border-l-violet-500' : ''
+                  }`}
+                >
                   <td className="px-4 py-3 max-w-[160px]">
-                    <span className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => setSelectedOferta(prev => (prev?.id === o.id ? null : o))}
+                      className="flex items-center gap-1.5 text-left w-full hover:text-violet-300 transition-colors"
+                    >
                       {o.vertical_risco && <span className="text-red-400 shrink-0" title="Vertical de risco">⚠️</span>}
                       <span className="truncate text-gray-200">{o.anunciante ?? '—'}</span>
-                    </span>
+                    </button>
                   </td>
                   <td className="px-3 py-3 text-gray-400 max-w-[120px]">
                     <span className="truncate block">{o.nicho ?? '—'}</span>
@@ -1164,6 +1189,18 @@ function CandidatasTab() {
           </tbody>
         </table>
       </div>
+
+      {/* Painel lateral de análise */}
+      {selectedOfertaAtualizada && (
+        <PainelAnalise
+          oferta={selectedOfertaAtualizada}
+          onClose={() => setSelectedOferta(null)}
+          onSaved={() => {
+            // painel permanece aberto após salvar
+          }}
+        />
+      )}
+      </div>
       <p className="text-xs font-mono text-gray-700">
         {candidatas.length} candidata{candidatas.length !== 1 ? 's' : ''}
       </p>
@@ -1174,11 +1211,19 @@ function CandidatasTab() {
 // ── Aba Infoapp (FR-6) ────────────────────────────────────────────────────────
 
 function InfoappTab() {
+  const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
+
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-infoapp'],
     queryFn: fetchInfoapp,
     staleTime: 30_000,
   })
+
+  // Manter selecionada sincronizada com dados atualizados
+  const selectedOfertaAtualizada = useMemo(() => {
+    if (!selectedOferta || !ofertas) return selectedOferta
+    return ofertas.find(o => o.id === selectedOferta.id) ?? selectedOferta
+  }, [selectedOferta, ofertas])
 
   if (isLoading) {
     return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando...</p>
@@ -1192,7 +1237,9 @@ function InfoappTab() {
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="overflow-x-auto rounded-xl border border-gray-800">
+      {/* Layout: tabela + painel */}
+      <div className={selectedOfertaAtualizada ? 'flex gap-4 items-start' : ''}>
+      <div className={`overflow-x-auto rounded-xl border border-gray-800 ${selectedOfertaAtualizada ? 'flex-1 min-w-0' : ''}`}>
         <table className="w-full text-sm font-mono">
           <thead>
             <tr className="border-b border-gray-800 bg-gray-900/60">
@@ -1211,13 +1258,23 @@ function InfoappTab() {
             </tr>
           </thead>
           <tbody>
-            {ofertas.map((o: Oferta) => (
-              <tr key={o.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
+            {ofertas.map((o: Oferta) => {
+              const isSelected = selectedOfertaAtualizada?.id === o.id
+              return (
+              <tr
+                key={o.id}
+                className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors ${
+                  isSelected ? 'bg-violet-500/5 border-l-2 border-l-violet-500' : ''
+                }`}
+              >
                 <td className="px-4 py-3 max-w-[160px]">
-                  <span className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => setSelectedOferta(prev => (prev?.id === o.id ? null : o))}
+                    className="flex items-center gap-1.5 text-left w-full hover:text-violet-300 transition-colors"
+                  >
                     {o.vertical_risco && <span className="text-red-400 shrink-0" title="Vertical de risco">⚠️</span>}
                     <span className="truncate text-gray-200">{o.anunciante ?? '—'}</span>
-                  </span>
+                  </button>
                 </td>
                 <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
                   {fmtMix(o.n_criativos_video, o.n_criativos_imagem)}
@@ -1255,9 +1312,22 @@ function InfoappTab() {
                   )}
                 </td>
               </tr>
-            ))}
+              )
+            })}
           </tbody>
         </table>
+      </div>
+
+      {/* Painel lateral de análise */}
+      {selectedOfertaAtualizada && (
+        <PainelAnalise
+          oferta={selectedOfertaAtualizada}
+          onClose={() => setSelectedOferta(null)}
+          onSaved={() => {
+            // painel permanece aberto após salvar
+          }}
+        />
+      )}
       </div>
       <p className="text-xs font-mono text-gray-700">
         {ofertas.length} oferta{ofertas.length !== 1 ? 's' : ''} infoapp
@@ -1474,6 +1544,7 @@ function RastrosTab() {
     mutationFn: insertRastro,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['lt-rastros'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-rastros-count'] })
       setShowForm(false)
       setFormQuery('')
       setFormGrupo('')
@@ -1831,6 +1902,12 @@ export function LowTicket() {
     staleTime: 60_000,
   })
 
+  const { data: rastrosCount } = useQuery({
+    queryKey: ['lt-rastros-count'],
+    queryFn: fetchRastrosCount,
+    staleTime: 60_000,
+  })
+
   // Tiles do header
   type TileKey = {
     key: Aba
@@ -1856,7 +1933,7 @@ export function LowTicket() {
       case 'candidatas': return counts.candidata ?? 0
       case 'infoapp':    return counts.infoapp ?? 0
       case 'arquivo':    return counts.arquivo ?? 0
-      case 'rastros':    return 0
+      case 'rastros':    return rastrosCount ?? 0
     }
   }
 
