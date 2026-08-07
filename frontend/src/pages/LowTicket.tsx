@@ -605,10 +605,13 @@ function useSort<K extends string>(def: K, defDir: 'asc' | 'desc' = 'asc') {
 // ── Aba Gate ──────────────────────────────────────────────────────────────────
 
 function GateTab() {
+  const queryClient = useQueryClient()
   const [filtroMercado, setFiltroMercado] = useState<string>('')
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
   const [showManualForm, setShowManualForm] = useState(false)
   const [toastMsg, setToastMsg] = useState<string | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [bulkConfirm, setBulkConfirm] = useState<'monitorar' | 'descartar' | null>(null)
   const gs = useSort<'n_anuncios_ativos'|'dias_ativo_oferta'|'nicho'|'mercado'|'preco_visivel'|'formato_entregavel'|'tipo_funil'>('n_anuncios_ativos', 'desc')
 
   const { data: ofertas, isLoading, error } = useQuery({
@@ -639,6 +642,49 @@ function GateTab() {
     if (!selectedOferta || !ofertas) return selectedOferta
     return ofertas.find(o => o.id === selectedOferta.id) ?? selectedOferta
   }, [selectedOferta, ofertas])
+
+  const bulkMonitorarMutation = useMutation({
+    mutationFn: () => Promise.all(
+      Array.from(selectedIds).map(id =>
+        updateOferta(id, { status: 'monitorando', data_inicio_monitoramento: new Date().toISOString().split('T')[0] })
+      )
+    ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      setSelectedIds(prev => { if (selectedOferta && prev.has(selectedOferta.id)) setSelectedOferta(null); return new Set() })
+      setBulkConfirm(null)
+    },
+  })
+
+  const bulkDescartarMutation = useMutation({
+    mutationFn: () => Promise.all(
+      Array.from(selectedIds).map(id => updateOferta(id, { status: 'descartada' }))
+    ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      setSelectedIds(prev => { if (selectedOferta && prev.has(selectedOferta.id)) setSelectedOferta(null); return new Set() })
+      setBulkConfirm(null)
+    },
+  })
+
+  const bulkActing = bulkMonitorarMutation.isPending || bulkDescartarMutation.isPending
+
+  function toggleId(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+
+  function toggleAll() {
+    const allIds = ofertasFiltradas.map(o => o.id)
+    const allSelected = allIds.length > 0 && allIds.every(id => selectedIds.has(id))
+    setSelectedIds(allSelected ? new Set() : new Set(allIds))
+  }
 
   function handleRowClick(o: Oferta) {
     setSelectedOferta(prev => (prev?.id === o.id ? null : o))
@@ -696,6 +742,37 @@ function GateTab() {
         </button>
       </div>
 
+      {/* Barra de seleção em lote */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-3 bg-gray-900 border border-violet-500/30 rounded-xl px-4 py-2.5 flex-wrap">
+          <span className="text-sm font-mono text-violet-300">
+            {selectedIds.size} selecionado{selectedIds.size !== 1 ? 's' : ''}
+          </span>
+          <div className="flex gap-2 ml-auto flex-wrap">
+            <button
+              onClick={() => setBulkConfirm('monitorar')}
+              disabled={bulkActing}
+              className="text-xs font-mono px-3 py-1.5 rounded-lg bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-600/30 transition-colors disabled:opacity-50 whitespace-nowrap"
+            >
+              Monitorar {selectedIds.size}
+            </button>
+            <button
+              onClick={() => setBulkConfirm('descartar')}
+              disabled={bulkActing}
+              className="text-xs font-mono px-3 py-1.5 rounded-lg bg-red-700/20 text-red-400 border border-red-500/30 hover:bg-red-700/30 transition-colors disabled:opacity-50 whitespace-nowrap"
+            >
+              Descartar {selectedIds.size}
+            </button>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="text-xs font-mono px-2 py-1.5 text-gray-600 hover:text-gray-400 transition-colors"
+            >
+              ✕ limpar
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Layout: tabela + painel */}
       <div className={selectedOferta ? 'flex gap-4 items-start' : ''}>
         {/* Tabela Gate */}
@@ -703,6 +780,14 @@ function GateTab() {
           <table className="w-full text-sm font-mono">
             <thead>
               <tr className="border-b border-gray-800 bg-gray-900/60">
+                <th className="px-3 py-3 w-8">
+                  <input
+                    type="checkbox"
+                    checked={ofertasFiltradas.length > 0 && ofertasFiltradas.every(o => selectedIds.has(o.id))}
+                    onChange={toggleAll}
+                    className="accent-violet-500 w-4 h-4 cursor-pointer"
+                  />
+                </th>
                 <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
                 <SortTh col="n_anuncios_ativos"  label="Ativos"   active={gs.key==='n_anuncios_ativos'}  dir={gs.dir} onSort={() => gs.sort('n_anuncios_ativos', true)} />
@@ -720,20 +805,31 @@ function GateTab() {
             <tbody>
               {ofertasFiltradas.length === 0 && (
                 <tr>
-                  <td colSpan={12} className="px-4 py-12 text-center text-gray-600 text-sm">
+                  <td colSpan={13} className="px-4 py-12 text-center text-gray-600 text-sm">
                     Nenhuma oferta no Gate
                   </td>
                 </tr>
               )}
               {ofertasFiltradas.map((o: Oferta) => {
                 const isSelected = selectedOferta?.id === o.id
+                const isChecked = selectedIds.has(o.id)
                 return (
                   <tr
                     key={o.id}
                     className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors ${
                       isSelected ? 'bg-violet-500/5 border-l-2 border-l-violet-500' : ''
-                    }`}
+                    } ${isChecked ? 'bg-violet-950/20' : ''}`}
                   >
+                    {/* Checkbox de seleção */}
+                    <td className="px-3 py-3 w-8">
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => toggleId(o.id)}
+                        className="accent-violet-500 w-4 h-4 cursor-pointer"
+                      />
+                    </td>
+
                     {/* Anunciante — clicável */}
                     <td className="px-4 py-3 max-w-[160px]">
                       <button
@@ -851,6 +947,41 @@ function GateTab() {
         />
       )}
 
+      {/* Confirm em lote */}
+      {bulkConfirm !== null && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-80 flex flex-col gap-4">
+            <p className="text-sm font-mono text-gray-200">
+              Confirmar:{' '}
+              <span className={bulkConfirm === 'monitorar' ? 'text-emerald-400' : 'text-red-400'}>
+                {bulkConfirm === 'monitorar' ? 'Monitorar' : 'Descartar'}
+              </span>{' '}
+              {selectedIds.size} oferta{selectedIds.size !== 1 ? 's' : ''}?
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => bulkConfirm === 'monitorar' ? bulkMonitorarMutation.mutate() : bulkDescartarMutation.mutate()}
+                disabled={bulkActing}
+                className={`flex-1 font-mono text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-60 ${
+                  bulkConfirm === 'monitorar'
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                    : 'bg-red-700/80 hover:bg-red-700 text-white'
+                }`}
+              >
+                {bulkActing ? 'Aguarde...' : 'Confirmar'}
+              </button>
+              <button
+                onClick={() => setBulkConfirm(null)}
+                disabled={bulkActing}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Toast */}
       {toastMsg && (
         <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />
@@ -912,11 +1043,42 @@ function TrackerTab() {
     overrideMutation.mutate({ id, status })
   }
 
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [bulkConfirm, setBulkConfirm] = useState<'descartar' | null>(null)
+
+  const bulkDescartarMutation = useMutation({
+    mutationFn: () => Promise.all(
+      Array.from(selectedIds).map(id => updateOferta(id, { status: 'descartada' }))
+    ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      setSelectedIds(new Set())
+      setBulkConfirm(null)
+    },
+  })
+
   const ts = useSort<'nicho'|'tipo_funil'|'data_inicio_monitoramento'|'dia_1'|'dia_atual'|'delta_7d'|'maximo'|'minimo'>('dia_atual', 'desc')
   const trackerOrdenados = useMemo(() => {
     if (!trackerRows) return []
     return sortRows(trackerRows, ts.key as any, ts.dir)
   }, [trackerRows, ts.key, ts.dir])
+
+  const bulkActing = bulkDescartarMutation.isPending
+
+  function toggleId(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+
+  function toggleAll() {
+    const allIds = trackerOrdenados.map(r => r.id)
+    const allSelected = allIds.length > 0 && allIds.every(id => selectedIds.has(id))
+    setSelectedIds(allSelected ? new Set() : new Set(allIds))
+  }
 
   if (loadingTracker) {
     return <p className="text-gray-600 font-mono text-sm py-8 text-center">Carregando tracker...</p>
@@ -943,10 +1105,43 @@ function TrackerTab() {
   }
 
   return (
-    <div className="overflow-x-auto rounded-xl border border-gray-800">
+    <div className="flex flex-col gap-3">
+      {/* Barra de seleção em lote */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-3 bg-gray-900 border border-violet-500/30 rounded-xl px-4 py-2.5 flex-wrap">
+          <span className="text-sm font-mono text-violet-300">
+            {selectedIds.size} selecionado{selectedIds.size !== 1 ? 's' : ''}
+          </span>
+          <div className="flex gap-2 ml-auto flex-wrap">
+            <button
+              onClick={() => setBulkConfirm('descartar')}
+              disabled={bulkActing}
+              className="text-xs font-mono px-3 py-1.5 rounded-lg bg-red-700/20 text-red-400 border border-red-500/30 hover:bg-red-700/30 transition-colors disabled:opacity-50 whitespace-nowrap"
+            >
+              Descartar {selectedIds.size}
+            </button>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="text-xs font-mono px-2 py-1.5 text-gray-600 hover:text-gray-400 transition-colors"
+            >
+              ✕ limpar
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded-xl border border-gray-800">
       <table className="w-full text-xs font-mono">
         <thead>
           <tr className="border-b border-gray-800 bg-gray-900/60">
+            <th className="px-3 py-2 w-8">
+              <input
+                type="checkbox"
+                checked={trackerOrdenados.length > 0 && trackerOrdenados.every(r => selectedIds.has(r.id))}
+                onChange={toggleAll}
+                className="accent-violet-500 w-4 h-4 cursor-pointer"
+              />
+            </th>
             <th className="text-gray-500 text-left px-3 py-2 font-normal border-b border-gray-800 whitespace-nowrap">Anunciante</th>
             <SortTh col="nicho"                     label="Nicho"    active={ts.key==='nicho'}                     dir={ts.dir} onSort={() => ts.sort('nicho')} />
             <SortTh col="tipo_funil"                label="Funil"    active={ts.key==='tipo_funil'}                dir={ts.dir} onSort={() => ts.sort('tipo_funil')} />
@@ -965,7 +1160,15 @@ function TrackerTab() {
         </thead>
         <tbody>
           {trackerOrdenados.map(row => (
-            <tr key={row.id} className="border-b border-gray-800/40 hover:bg-gray-900/60">
+            <tr key={row.id} className={`border-b border-gray-800/40 hover:bg-gray-900/60 ${selectedIds.has(row.id) ? 'bg-violet-950/20' : ''}`}>
+              <td className="px-3 py-2.5 w-8">
+                <input
+                  type="checkbox"
+                  checked={selectedIds.has(row.id)}
+                  onChange={() => toggleId(row.id)}
+                  className="accent-violet-500 w-4 h-4 cursor-pointer"
+                />
+              </td>
               <td className="px-3 py-2.5 text-gray-300 max-w-[140px]">
                 <span className="truncate block">{row.anunciante ?? '—'}</span>
               </td>
@@ -1039,6 +1242,34 @@ function TrackerTab() {
       <p className="text-xs font-mono text-gray-700 px-3 py-2">
         {trackerRows.length} oferta{trackerRows.length !== 1 ? 's' : ''} em monitoramento
       </p>
+      </div>
+
+      {/* Confirm em lote */}
+      {bulkConfirm !== null && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-80 flex flex-col gap-4">
+            <p className="text-sm font-mono text-gray-200">
+              Descartar <span className="text-red-400">{selectedIds.size} oferta{selectedIds.size !== 1 ? 's' : ''}</span>?
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => bulkDescartarMutation.mutate()}
+                disabled={bulkActing}
+                className="flex-1 font-mono text-sm px-4 py-2 rounded-lg bg-red-700/80 hover:bg-red-700 text-white transition-colors disabled:opacity-60"
+              >
+                {bulkActing ? 'Aguarde...' : 'Confirmar'}
+              </button>
+              <button
+                onClick={() => setBulkConfirm(null)}
+                disabled={bulkActing}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1256,7 +1487,10 @@ function CandidatasTab() {
 // ── Aba Infoapp (FR-6) ────────────────────────────────────────────────────────
 
 function InfoappTab() {
+  const queryClient = useQueryClient()
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [bulkConfirm, setBulkConfirm] = useState<'monitorar' | 'descartar' | null>(null)
 
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-infoapp'],
@@ -1276,6 +1510,51 @@ function InfoappTab() {
     return sortRows(ofertas, iis.key as keyof Oferta, iis.dir)
   }, [ofertas, iis.key, iis.dir])
 
+  const bulkMonitorarMutation = useMutation({
+    mutationFn: () => Promise.all(
+      Array.from(selectedIds).map(id =>
+        updateOferta(id, { status: 'monitorando', data_inicio_monitoramento: new Date().toISOString().split('T')[0] })
+      )
+    ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      setSelectedOferta(prev => (prev && selectedIds.has(prev.id) ? null : prev))
+      setSelectedIds(new Set())
+      setBulkConfirm(null)
+    },
+  })
+
+  const bulkDescartarMutation = useMutation({
+    mutationFn: () => Promise.all(
+      Array.from(selectedIds).map(id => updateOferta(id, { status: 'descartada' }))
+    ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      setSelectedOferta(prev => (prev && selectedIds.has(prev.id) ? null : prev))
+      setSelectedIds(new Set())
+      setBulkConfirm(null)
+    },
+  })
+
+  const bulkActing = bulkMonitorarMutation.isPending || bulkDescartarMutation.isPending
+
+  function toggleId(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }
+
+  function toggleAll() {
+    const allIds = ofertasOrdenadas.map(o => o.id)
+    const allSelected = allIds.length > 0 && allIds.every(id => selectedIds.has(id))
+    setSelectedIds(allSelected ? new Set() : new Set(allIds))
+  }
+
   if (isLoading) {
     return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando...</p>
   }
@@ -1288,12 +1567,51 @@ function InfoappTab() {
 
   return (
     <div className="flex flex-col gap-3">
+      {/* Barra de seleção em lote */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-3 bg-gray-900 border border-violet-500/30 rounded-xl px-4 py-2.5 flex-wrap">
+          <span className="text-sm font-mono text-violet-300">
+            {selectedIds.size} selecionado{selectedIds.size !== 1 ? 's' : ''}
+          </span>
+          <div className="flex gap-2 ml-auto flex-wrap">
+            <button
+              onClick={() => setBulkConfirm('monitorar')}
+              disabled={bulkActing}
+              className="text-xs font-mono px-3 py-1.5 rounded-lg bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-600/30 transition-colors disabled:opacity-50 whitespace-nowrap"
+            >
+              Monitorar {selectedIds.size}
+            </button>
+            <button
+              onClick={() => setBulkConfirm('descartar')}
+              disabled={bulkActing}
+              className="text-xs font-mono px-3 py-1.5 rounded-lg bg-red-700/20 text-red-400 border border-red-500/30 hover:bg-red-700/30 transition-colors disabled:opacity-50 whitespace-nowrap"
+            >
+              Descartar {selectedIds.size}
+            </button>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="text-xs font-mono px-2 py-1.5 text-gray-600 hover:text-gray-400 transition-colors"
+            >
+              ✕ limpar
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Layout: tabela + painel */}
       <div className={selectedOfertaAtualizada ? 'flex gap-4 items-start' : ''}>
       <div className={`overflow-x-auto rounded-xl border border-gray-800 ${selectedOfertaAtualizada ? 'flex-1 min-w-0' : ''}`}>
         <table className="w-full text-sm font-mono">
           <thead>
             <tr className="border-b border-gray-800 bg-gray-900/60">
+              <th className="px-3 py-3 w-8">
+                <input
+                  type="checkbox"
+                  checked={ofertasOrdenadas.length > 0 && ofertasOrdenadas.every(o => selectedIds.has(o.id))}
+                  onChange={toggleAll}
+                  className="accent-violet-500 w-4 h-4 cursor-pointer"
+                />
+              </th>
               <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
               <SortTh col="n_anuncios_ativos"  label="Ativos"   active={iis.key==='n_anuncios_ativos'}  dir={iis.dir} onSort={() => iis.sort('n_anuncios_ativos', true)} />
@@ -1311,13 +1629,22 @@ function InfoappTab() {
           <tbody>
             {ofertasOrdenadas.map((o: Oferta) => {
               const isSelected = selectedOfertaAtualizada?.id === o.id
+              const isChecked = selectedIds.has(o.id)
               return (
               <tr
                 key={o.id}
                 className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors ${
                   isSelected ? 'bg-violet-500/5 border-l-2 border-l-violet-500' : ''
-                }`}
+                } ${isChecked ? 'bg-violet-950/20' : ''}`}
               >
+                <td className="px-3 py-3 w-8">
+                  <input
+                    type="checkbox"
+                    checked={isChecked}
+                    onChange={() => toggleId(o.id)}
+                    className="accent-violet-500 w-4 h-4 cursor-pointer"
+                  />
+                </td>
                 <td className="px-4 py-3 max-w-[160px]">
                   <button
                     onClick={() => setSelectedOferta(prev => (prev?.id === o.id ? null : o))}
@@ -1383,6 +1710,41 @@ function InfoappTab() {
       <p className="text-xs font-mono text-gray-700">
         {ofertas.length} oferta{ofertas.length !== 1 ? 's' : ''} infoapp
       </p>
+
+      {/* Confirm em lote */}
+      {bulkConfirm !== null && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-80 flex flex-col gap-4">
+            <p className="text-sm font-mono text-gray-200">
+              Confirmar:{' '}
+              <span className={bulkConfirm === 'monitorar' ? 'text-emerald-400' : 'text-red-400'}>
+                {bulkConfirm === 'monitorar' ? 'Monitorar' : 'Descartar'}
+              </span>{' '}
+              {selectedIds.size} oferta{selectedIds.size !== 1 ? 's' : ''}?
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => bulkConfirm === 'monitorar' ? bulkMonitorarMutation.mutate() : bulkDescartarMutation.mutate()}
+                disabled={bulkActing}
+                className={`flex-1 font-mono text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-60 ${
+                  bulkConfirm === 'monitorar'
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                    : 'bg-red-700/80 hover:bg-red-700 text-white'
+                }`}
+              >
+                {bulkActing ? 'Aguarde...' : 'Confirmar'}
+              </button>
+              <button
+                onClick={() => setBulkConfirm(null)}
+                disabled={bulkActing}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
