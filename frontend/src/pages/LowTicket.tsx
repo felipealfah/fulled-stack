@@ -17,6 +17,11 @@ import {
   updateRastro,
   updateOferta,
   insertOferta,
+  fetchBlacklistCount,
+  fetchBlacklist,
+  addToBlacklist,
+  removeFromBlacklist,
+  bloquearOfertasAnunciante,
   type Oferta,
   type OfertaStatus,
   type TipoFunil,
@@ -25,6 +30,7 @@ import {
   type Rastro,
   type RastroGrupo,
   type RastroStatus,
+  type BlacklistEntry,
 } from '../lib/lowticket'
 
 // ── Status config ─────────────────────────────────────────────────────────────
@@ -43,7 +49,7 @@ const STATUS_CFG = {
 
 // ── Tipo das abas ─────────────────────────────────────────────────────────────
 
-type Aba = 'gate' | 'tracker' | 'candidatas' | 'infoapp' | 'arquivo' | 'rastros'
+type Aba = 'gate' | 'tracker' | 'candidatas' | 'infoapp' | 'arquivo' | 'rastros' | 'blacklist'
 
 // ── Helpers de formatação ─────────────────────────────────────────────────────
 
@@ -570,6 +576,313 @@ function Toast({ message, onDismiss }: { message: string; onDismiss: () => void 
   )
 }
 
+// ── Modal: Bloquear Anunciante ────────────────────────────────────────────────
+
+interface ModalBloquearAnuncianteProps {
+  anunciante: string
+  onClose: () => void
+  onSuccess: (msg: string) => void
+}
+
+function ModalBloquearAnunciante({ anunciante, onClose, onSuccess }: ModalBloquearAnuncianteProps) {
+  const queryClient = useQueryClient()
+  const [tipo, setTipo] = useState<'exato' | 'contem' | 'regex'>('exato')
+  const [motivo, setMotivo] = useState('via front')
+  const [varrer, setVarrer] = useState(true)
+  const [formError, setFormError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+
+  const padraoShort = anunciante.trim().length < 4
+
+  useEffect(() => {
+    if (padraoShort) setTipo('exato')
+  }, [padraoShort])
+
+  async function handleConfirm() {
+    if (tipo === 'regex') {
+      try { new RegExp(anunciante) } catch {
+        setFormError('Regex inválida — corrija o padrão antes de bloquear')
+        return
+      }
+    }
+    setFormError(null)
+    setSubmitting(true)
+    try {
+      const { inserted } = await addToBlacklist(anunciante.trim(), tipo, motivo)
+      let afetadas = 0
+      if (varrer) {
+        afetadas = await bloquearOfertasAnunciante(anunciante.trim(), tipo)
+        queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+        queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
+        queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
+        queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      }
+      queryClient.invalidateQueries({ queryKey: ['lt-blacklist'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-blacklist-count'] })
+      const suffix = `${afetadas} oferta${afetadas !== 1 ? 's' : ''} marcada${afetadas !== 1 ? 's' : ''} como descartada.`
+      const msg = inserted
+        ? `Anunciante bloqueado. ${suffix}`
+        : `Já estava na lista. ${suffix}`
+      onSuccess(msg)
+      onClose()
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Erro ao bloquear')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const inputCls = 'w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-100 focus:outline-none focus:border-violet-500'
+  const labelCls = 'text-xs font-mono text-gray-500 mb-1 block'
+
+  return (
+    <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center px-4">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-full max-w-md flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-mono font-semibold text-gray-100">Bloquear Anunciante</h2>
+          <button onClick={onClose} className="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none">×</button>
+        </div>
+        <p className="text-sm font-mono text-gray-300 truncate">{anunciante}</p>
+        <div>
+          <label className={labelCls}>Tipo de match</label>
+          <select
+            value={tipo}
+            onChange={e => setTipo(e.target.value as 'exato' | 'contem' | 'regex')}
+            disabled={padraoShort}
+            className={inputCls}
+          >
+            <option value="exato">exato</option>
+            <option value="contem" disabled={padraoShort}>contem</option>
+            <option value="regex">regex</option>
+          </select>
+          {padraoShort && (
+            <p className="text-xs font-mono text-amber-500 mt-1">Nome curto — apenas match exato disponível</p>
+          )}
+        </div>
+        <div>
+          <label className={labelCls}>Motivo</label>
+          <input
+            type="text"
+            value={motivo}
+            onChange={e => setMotivo(e.target.value)}
+            className={inputCls}
+            placeholder="via front"
+          />
+        </div>
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={varrer}
+            onChange={e => setVarrer(e.target.checked)}
+            className="accent-red-500 w-4 h-4"
+          />
+          <span className="text-sm font-mono text-gray-300">Varrer ofertas existentes deste anunciante</span>
+        </label>
+        {formError && <p className="text-red-400 text-xs font-mono">{formError}</p>}
+        <div className="flex gap-2">
+          <button
+            onClick={handleConfirm}
+            disabled={submitting}
+            className="flex-1 bg-red-700/80 hover:bg-red-700 disabled:opacity-60 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+          >
+            {submitting ? 'Bloqueando...' : '🚫 Bloquear'}
+          </button>
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+          >
+            Cancelar
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Aba Blacklist ─────────────────────────────────────────────────────────────
+
+function BlacklistTab() {
+  const queryClient = useQueryClient()
+  const [novoPadrao, setNovoPadrao] = useState('')
+  const [novoTipo, setNovoTipo] = useState<'exato' | 'contem' | 'regex'>('exato')
+  const [novoMotivo, setNovoMotivo] = useState('')
+  const [varrerAoAdicionar, setVarrerAoAdicionar] = useState(false)
+  const [formError, setFormError] = useState<string | null>(null)
+  const [toastMsg, setToastMsg] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+
+  const { data: entries, isLoading, error } = useQuery({
+    queryKey: ['lt-blacklist'],
+    queryFn: fetchBlacklist,
+    staleTime: 30_000,
+  })
+
+  const removeMutation = useMutation({
+    mutationFn: (id: number) => removeFromBlacklist(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['lt-blacklist'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-blacklist-count'] })
+    },
+  })
+
+  const padraoShort = novoPadrao.trim().length > 0 && novoPadrao.trim().length < 4
+
+  async function handleAdd() {
+    const padrao = novoPadrao.trim()
+    if (!padrao) { setFormError('Padrão obrigatório'); return }
+    if (novoTipo === 'regex') {
+      try { new RegExp(padrao) } catch {
+        setFormError('Regex inválida')
+        return
+      }
+    }
+    setFormError(null)
+    setSubmitting(true)
+    try {
+      const { inserted } = await addToBlacklist(padrao, novoTipo, novoMotivo.trim() || 'via front')
+      let afetadas = 0
+      if (varrerAoAdicionar) {
+        afetadas = await bloquearOfertasAnunciante(padrao, novoTipo)
+        queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
+        queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
+        queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
+        queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
+      }
+      queryClient.invalidateQueries({ queryKey: ['lt-blacklist'] })
+      queryClient.invalidateQueries({ queryKey: ['lt-blacklist-count'] })
+      const extra = afetadas > 0 ? ` ${afetadas} oferta${afetadas !== 1 ? 's' : ''} varrida${afetadas !== 1 ? 's' : ''}.` : ''
+      setToastMsg(inserted ? `Adicionado.${extra}` : `Padrão já estava na lista.${extra}`)
+      setNovoPadrao('')
+      setNovoMotivo('')
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Erro ao adicionar')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const TIPO_BADGE: Record<string, string> = {
+    exato: 'bg-gray-700/40 text-gray-400 border-gray-700',
+    contem: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
+    regex: 'bg-violet-500/10 text-violet-400 border-violet-500/30',
+  }
+
+  const inputCls = 'bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-100 focus:outline-none focus:border-violet-500'
+
+  if (isLoading) return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando blacklist...</p>
+  if (error) return <p className="text-red-400 text-sm font-mono py-12 text-center">Erro ao carregar blacklist.</p>
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Form de adicionar */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex flex-col gap-3">
+        <p className="text-xs font-mono text-gray-500 uppercase tracking-wider">Adicionar entrada</p>
+        <div className="flex gap-3 flex-wrap">
+          <input
+            type="text"
+            placeholder="padrão"
+            value={novoPadrao}
+            onChange={e => setNovoPadrao(e.target.value)}
+            className={`${inputCls} flex-1 min-w-[160px]`}
+          />
+          <select
+            value={novoTipo}
+            onChange={e => setNovoTipo(e.target.value as 'exato' | 'contem' | 'regex')}
+            disabled={padraoShort}
+            className={inputCls}
+          >
+            <option value="exato">exato</option>
+            <option value="contem" disabled={padraoShort}>contem</option>
+            <option value="regex">regex</option>
+          </select>
+          <input
+            type="text"
+            placeholder="motivo (opcional)"
+            value={novoMotivo}
+            onChange={e => setNovoMotivo(e.target.value)}
+            className={`${inputCls} flex-1 min-w-[160px]`}
+          />
+        </div>
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={varrerAoAdicionar}
+              onChange={e => setVarrerAoAdicionar(e.target.checked)}
+              className="accent-amber-400 w-4 h-4"
+            />
+            <span className="text-sm font-mono text-gray-400">Varrer ofertas existentes agora</span>
+          </label>
+          <button
+            onClick={handleAdd}
+            disabled={submitting || !novoPadrao.trim()}
+            className="bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white font-mono text-sm px-4 py-2 rounded-lg transition-colors"
+          >
+            {submitting ? 'Adicionando...' : 'Adicionar'}
+          </button>
+        </div>
+        {padraoShort && <p className="text-xs font-mono text-amber-500">Nome curto (&lt;4 chars) — apenas match exato disponível</p>}
+        {formError && <p className="text-red-400 text-xs font-mono">{formError}</p>}
+      </div>
+
+      {/* Tabela de entradas */}
+      {entries && entries.length > 0 ? (
+        <div className="overflow-x-auto rounded-xl border border-gray-800">
+          <table className="w-full text-sm font-mono">
+            <thead>
+              <tr className="border-b border-gray-800 bg-gray-900/60">
+                <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Padrão</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Tipo</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Motivo</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Criado em</th>
+                <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Ação</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(entries as BlacklistEntry[]).map(e => (
+                <tr key={e.id} className="border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors">
+                  <td className="px-4 py-3 text-gray-200 max-w-[240px]">
+                    <span className="truncate block">{e.padrao}</span>
+                  </td>
+                  <td className="px-3 py-3">
+                    <span className={`text-[11px] font-mono px-2 py-0.5 rounded-full border ${TIPO_BADGE[e.tipo] ?? TIPO_BADGE.exato}`}>
+                      {e.tipo}
+                    </span>
+                  </td>
+                  <td className="px-3 py-3 text-gray-500 max-w-[200px]">
+                    <span className="truncate block">{e.motivo ?? '—'}</span>
+                  </td>
+                  <td className="px-3 py-3 text-gray-600 text-xs whitespace-nowrap">
+                    {fmtDate(e.criado_em)}
+                  </td>
+                  <td className="px-3 py-3">
+                    <button
+                      onClick={() => removeMutation.mutate(e.id)}
+                      disabled={removeMutation.isPending}
+                      title="Remover da blacklist (não reverte ofertas já descartadas)"
+                      className="text-gray-600 hover:text-red-400 transition-colors disabled:opacity-50"
+                    >
+                      🗑
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="text-xs font-mono text-gray-700 px-3 py-2">
+            {entries.length} entrada{entries.length !== 1 ? 's' : ''} na blacklist · remover não desfaz bloqueios em ofertas
+          </p>
+        </div>
+      ) : (
+        <p className="text-gray-600 font-mono text-sm py-8 text-center">Blacklist vazia.</p>
+      )}
+
+      {toastMsg && <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />}
+    </div>
+  )
+}
+
 // ── Helpers de ordenação (compartilhados) ────────────────────────────────────
 
 function sortRows<T>(rows: T[], key: keyof T, dir: 'asc' | 'desc'): T[] {
@@ -612,6 +925,7 @@ function GateTab() {
   const [toastMsg, setToastMsg] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [bulkConfirm, setBulkConfirm] = useState<'monitorar' | 'descartar' | null>(null)
+  const [bloquearTarget, setBloquearTarget] = useState<string | null>(null)
   const gs = useSort<'n_anuncios_ativos'|'dias_ativo_oferta'|'nicho'|'mercado'|'preco_visivel'|'formato_entregavel'|'tipo_funil'>('n_anuncios_ativos', 'desc')
 
   const { data: ofertas, isLoading, error } = useQuery({
@@ -800,12 +1114,13 @@ function GateTab() {
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
                 <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
+                <th className="px-3 py-3 w-8"></th>
               </tr>
             </thead>
             <tbody>
               {ofertasFiltradas.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="px-4 py-12 text-center text-gray-600 text-sm">
+                  <td colSpan={14} className="px-4 py-12 text-center text-gray-600 text-sm">
                     Nenhuma oferta no Gate
                   </td>
                 </tr>
@@ -909,6 +1224,17 @@ function GateTab() {
                         <span className="text-gray-700 text-xs">—</span>
                       )}
                     </td>
+
+                    {/* Bloquear anunciante */}
+                    <td className="px-3 py-3">
+                      <button
+                        onClick={e => { e.stopPropagation(); setBloquearTarget(o.anunciante ?? '') }}
+                        title="Bloquear anunciante"
+                        className="text-gray-600 hover:text-red-400 transition-colors text-base"
+                      >
+                        🚫
+                      </button>
+                    </td>
                   </tr>
                 )
               })}
@@ -932,6 +1258,15 @@ function GateTab() {
         {ofertasFiltradas.length} oferta{ofertasFiltradas.length !== 1 ? 's' : ''} no gate
         {filtroMercado ? ` · mercado: ${filtroMercado}` : ''}
       </p>
+
+      {/* Modal bloquear anunciante */}
+      {bloquearTarget !== null && bloquearTarget !== '' && (
+        <ModalBloquearAnunciante
+          anunciante={bloquearTarget}
+          onClose={() => setBloquearTarget(null)}
+          onSuccess={msg => { setBloquearTarget(null); setToastMsg(msg) }}
+        />
+      )}
 
       {/* Modal oferta manual */}
       {showManualForm && (
@@ -1279,6 +1614,8 @@ function TrackerTab() {
 function CandidatasTab() {
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
+  const [bloquearTarget, setBloquearTarget] = useState<string | null>(null)
+  const [toastMsg, setToastMsg] = useState<string | null>(null)
 
   const { data: candidatas, isLoading, error } = useQuery({
     queryKey: ['lt-candidatas'],
@@ -1376,6 +1713,7 @@ function CandidatasTab() {
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Observações</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Briefing</th>
+              <th className="px-3 py-3 w-8"></th>
             </tr>
           </thead>
           <tbody>
@@ -1459,6 +1797,17 @@ function CandidatasTab() {
                       </button>
                     )}
                   </td>
+
+                  {/* Bloquear anunciante */}
+                  <td className="px-3 py-3">
+                    <button
+                      onClick={e => { e.stopPropagation(); setBloquearTarget(o.anunciante ?? '') }}
+                      title="Bloquear anunciante"
+                      className="text-gray-600 hover:text-red-400 transition-colors text-base"
+                    >
+                      🚫
+                    </button>
+                  </td>
                 </tr>
               )
             })}
@@ -1480,6 +1829,16 @@ function CandidatasTab() {
       <p className="text-xs font-mono text-gray-700">
         {candidatas.length} candidata{candidatas.length !== 1 ? 's' : ''}
       </p>
+
+      {/* Modal bloquear anunciante */}
+      {bloquearTarget !== null && bloquearTarget !== '' && (
+        <ModalBloquearAnunciante
+          anunciante={bloquearTarget}
+          onClose={() => setBloquearTarget(null)}
+          onSuccess={msg => { setBloquearTarget(null); setToastMsg(msg) }}
+        />
+      )}
+      {toastMsg && <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />}
     </div>
   )
 }
@@ -1491,6 +1850,8 @@ function InfoappTab() {
   const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [bulkConfirm, setBulkConfirm] = useState<'monitorar' | 'descartar' | null>(null)
+  const [bloquearTarget, setBloquearTarget] = useState<string | null>(null)
+  const [toastMsg, setToastMsg] = useState<string | null>(null)
 
   const { data: ofertas, isLoading, error } = useQuery({
     queryKey: ['lt-infoapp'],
@@ -1624,6 +1985,7 @@ function InfoappTab() {
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
               <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
+              <th className="px-3 py-3 w-8"></th>
             </tr>
           </thead>
           <tbody>
@@ -1689,6 +2051,17 @@ function InfoappTab() {
                     <span className="text-gray-700 text-xs">—</span>
                   )}
                 </td>
+
+                {/* Bloquear anunciante */}
+                <td className="px-3 py-3">
+                  <button
+                    onClick={e => { e.stopPropagation(); setBloquearTarget(o.anunciante ?? '') }}
+                    title="Bloquear anunciante"
+                    className="text-gray-600 hover:text-red-400 transition-colors text-base"
+                  >
+                    🚫
+                  </button>
+                </td>
               </tr>
               )
             })}
@@ -1710,6 +2083,16 @@ function InfoappTab() {
       <p className="text-xs font-mono text-gray-700">
         {ofertas.length} oferta{ofertas.length !== 1 ? 's' : ''} infoapp
       </p>
+
+      {/* Modal bloquear anunciante */}
+      {bloquearTarget !== null && bloquearTarget !== '' && (
+        <ModalBloquearAnunciante
+          anunciante={bloquearTarget}
+          onClose={() => setBloquearTarget(null)}
+          onSuccess={msg => { setBloquearTarget(null); setToastMsg(msg) }}
+        />
+      )}
+      {toastMsg && <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />}
 
       {/* Confirm em lote */}
       {bulkConfirm !== null && (
@@ -2359,6 +2742,12 @@ export function LowTicket() {
     staleTime: 60_000,
   })
 
+  const { data: blacklistCount } = useQuery({
+    queryKey: ['lt-blacklist-count'],
+    queryFn: fetchBlacklistCount,
+    staleTime: 60_000,
+  })
+
   // Tiles do header
   type TileKey = {
     key: Aba
@@ -2374,17 +2763,18 @@ export function LowTicket() {
     { key: 'infoapp',    label: '⭐ Infoapp',  cls: 'text-amber-300' },
     { key: 'arquivo',    label: 'Arquivo',     cls: 'text-gray-500' },
     { key: 'rastros',    label: 'Rastros',     cls: 'text-gray-400' },
+    { key: 'blacklist',  label: '🚫 Blacklist', cls: 'text-red-500' },
   ]
 
   function getTileCount(key: Aba): number {
-    if (!counts) return 0
     switch (key) {
-      case 'gate':       return (counts.alerta ?? 0) + (counts.em_analise_funil ?? 0)
-      case 'tracker':    return (counts.monitorando ?? 0) + (counts.em_escala ?? 0)
-      case 'candidatas': return counts.candidata ?? 0
-      case 'infoapp':    return counts.infoapp ?? 0
-      case 'arquivo':    return counts.arquivo ?? 0
+      case 'gate':       return counts ? (counts.alerta ?? 0) + (counts.em_analise_funil ?? 0) : 0
+      case 'tracker':    return counts ? (counts.monitorando ?? 0) + (counts.em_escala ?? 0) : 0
+      case 'candidatas': return counts ? counts.candidata ?? 0 : 0
+      case 'infoapp':    return counts ? counts.infoapp ?? 0 : 0
+      case 'arquivo':    return counts ? counts.arquivo ?? 0 : 0
       case 'rastros':    return rastrosCount ?? 0
+      case 'blacklist':  return blacklistCount ?? 0
     }
   }
 
@@ -2393,9 +2783,10 @@ export function LowTicket() {
     { key: 'gate',       label: 'Gate' },
     { key: 'tracker',    label: 'Tracker' },
     { key: 'candidatas', label: 'Candidatas' },
-    { key: 'infoapp',   label: 'Infoapp' },
-    { key: 'arquivo',   label: 'Arquivo' },
-    { key: 'rastros',   label: 'Rastros' },
+    { key: 'infoapp',    label: 'Infoapp' },
+    { key: 'arquivo',    label: 'Arquivo' },
+    { key: 'rastros',    label: 'Rastros' },
+    { key: 'blacklist',  label: '🚫 Blacklist' },
   ]
 
   return (
@@ -2468,6 +2859,7 @@ export function LowTicket() {
         {aba === 'infoapp'    && <InfoappTab />}
         {aba === 'arquivo'    && <ArquivoTab />}
         {aba === 'rastros'    && <RastrosTab />}
+        {aba === 'blacklist'  && <BlacklistTab />}
       </main>
     </div>
   )

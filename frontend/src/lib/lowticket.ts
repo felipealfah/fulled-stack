@@ -424,3 +424,66 @@ export async function updateRastro(
 
   if (error) throw error
 }
+
+// ── Helpers de Blacklist ──────────────────────────────────────────────────────
+
+export interface BlacklistEntry {
+  id: number
+  padrao: string
+  tipo: 'exato' | 'contem' | 'regex'
+  motivo: string | null
+  criado_em: string
+}
+
+export async function fetchBlacklistCount(): Promise<number> {
+  const { count, error } = await supabaseLT
+    .from('anunciantes_blocklist')
+    .select('*', { count: 'exact', head: true })
+
+  if (error) throw error
+  return count ?? 0
+}
+
+export async function fetchBlacklist(): Promise<BlacklistEntry[]> {
+  const { data, error } = await supabaseLT
+    .from('anunciantes_blocklist')
+    .select('id, padrao, tipo, motivo, criado_em')
+    .order('criado_em', { ascending: false })
+
+  if (error) throw error
+  return (data ?? []) as BlacklistEntry[]
+}
+
+export async function addToBlacklist(
+  padrao: string,
+  tipo: 'exato' | 'contem' | 'regex',
+  motivo: string
+): Promise<{ inserted: boolean }> {
+  const { data, error } = await supabaseLT
+    .from('anunciantes_blocklist')
+    .upsert(
+      { padrao, tipo, motivo },
+      { onConflict: 'padrao,tipo', ignoreDuplicates: true }
+    )
+    .select()
+
+  if (error) throw error
+  return { inserted: (data?.length ?? 0) > 0 }
+}
+
+export async function removeFromBlacklist(id: number): Promise<void> {
+  const { error } = await supabaseLT.from('anunciantes_blocklist').delete().eq('id', id)
+  if (error) throw error
+}
+
+export async function bloquearOfertasAnunciante(
+  padrao: string,
+  tipo: 'exato' | 'contem' | 'regex'
+): Promise<number> {
+  const { data, error } = await supabaseLT.rpc('bloquear_ofertas_anunciante', {
+    p_padrao: padrao,
+    p_tipo: tipo,
+  })
+  if (error) throw error
+  return (data as number) ?? 0
+}
