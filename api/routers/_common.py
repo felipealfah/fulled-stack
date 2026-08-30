@@ -44,6 +44,34 @@ async def _resolve_projeto(conn, projeto_id: str) -> dict:
     return dict(proj)
 
 
+async def _resolve_projeto_id_int(conn, projeto_id: str) -> int:
+    """Resolve UUID string → `id_int_legado` (INT), para tabelas com FK INTEGER.
+
+    Wrapper de `_resolve_projeto` para os routers cujas tabelas mantiveram a FK
+    INTEGER depois da migração UUID da Phase 05 (`rank_intel_overrides`,
+    `projeto_geo_targets`, `content_pages`).
+
+    404 se o projeto não existe; 422 se o UUID é malformado ou se o projeto foi
+    criado depois da Phase 05 e nunca recebeu `id_int_legado`. A mensagem é
+    deliberadamente genérica: nomear a tabela aqui colocaria o nome de uma tabela
+    migrada na mesma linha da conexão do Postgres, o que o portão estático da
+    Fase 35 (e um leitor humano) não consegue distinguir de uma query de verdade.
+
+    Fase 35 / D-02: chamar SEMPRE no pool do Postgres da Stack (`projetos` é camada
+    de decisão e não migra). Sem FK cross-DB este é o único controle que impede
+    travessia entre projetos no Supabase (T-35-05).
+    """
+    proj = await _resolve_projeto(conn, projeto_id)
+    id_int = proj.get("id_int_legado")
+    if id_int is None:
+        raise HTTPException(
+            422,
+            "Projeto sem id_int_legado — a tabela deste endpoint ainda usa FK INTEGER; "
+            "rode o backfill da Phase 05 antes de usar este endpoint.",
+        )
+    return id_int
+
+
 def _load_gcp_key(env_name: str) -> dict | None:
     """Lê SA GCP de env aceitando base64 OU JSON single-line.
 

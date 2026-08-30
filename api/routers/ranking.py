@@ -1,11 +1,27 @@
 """ranking.py — GET /projetos/{id}/ranking
 
-Le ranking_dashboard_cache e ranking_history_cache do Postgres local.
+Le ranking_dashboard_cache e ranking_history_cache do **Supabase** (schema `leadgen`).
 Phase 03: migrado de DuckDB/Parquet para BQ.
 2026-07-23: migrado de BQ live para cache Postgres — o workflow n8n
 "[LEADGEN] Sync Gold → Postgres" (05:00) puxa o gold do BQ 1x/dia e grava
 nas tabelas *_cache. A API não consulta mais o BigQuery.
 Ver ADR 2026-07-23_Ranking_Cache_Postgres_n8n (Full_AIOS_LEADGEN).
+
+## Fase 35 / D-02 — as duas tabelas *_cache mudaram de banco
+ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+Os 3 handlers de ranking passam a ser de dois passos, sem uma linha de SQL alterada:
+
+  1. `c_pg` (pool do Postgres da Stack) resolve o projeto em `projetos` — camada de
+     decisão, que NÃO migra. Sem FK cross-DB esse passo deixa de ser conveniência e
+     vira o **único** controle de acesso entre projetos (mitigação T-35-05).
+  2. `c_lg` (pool do Supabase, `db_leadgen.get_lg_pool`) lê as tabelas *_cache. O
+     `search_path=leadgen` do pool resolve o schema, então as queries continuam
+     dizendo `FROM ranking_dashboard_cache` sem prefixo.
+
+⚠️ O workflow n8n "[LEADGEN] Sync Gold → Postgres" ainda grava no Postgres da Stack.
+Enquanto ele não for repontado para o Supabase, o cache lido aqui congela na carga da
+Fase 35 (ver 35-02-SUMMARY.md).
 
 Se dados nao existirem no cache (sync ainda nao rodou): {"status": "not_ready", ...}
 Se projeto nao existir: 404
@@ -21,6 +37,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException
 
 from db import get_pool
+from db_leadgen import get_lg_pool
 
 router = APIRouter(prefix="/projetos", tags=["ranking"])
 
@@ -210,9 +227,10 @@ def _compute_report(history_rows: list[dict], projeto_id_int: int, projeto_nome:
 
 @router.get("/{projeto_id}/ranking")
 async def get_ranking(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+    # Passo 1 — projeto resolvido no Postgres da Stack (camada de decisão).
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        row = await c_pg.fetchrow(
             "SELECT projeto_nome, id_int_legado, metadata->>'dominio' AS dominio FROM projetos WHERE id = $1",
             projeto_id,
         )
@@ -221,9 +239,12 @@ async def get_ranking(projeto_id: str):
 
     projeto_id_int = row["id_int_legado"]
 
+    # Fase 35 / D-02: ranking_dashboard_cache mora no Supabase (schema leadgen).
+    # ADR 2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+    lg = await get_lg_pool()
     try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
+        async with lg.acquire() as c_lg:
+            rows = await c_lg.fetch(
                 """
                 SELECT *
                 FROM ranking_dashboard_cache
@@ -271,9 +292,10 @@ async def get_ranking_history(projeto_id: str, keyword: Optional[str] = None):
 
     Query param opcional: keyword=<texto> — filtra para uma única keyword.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+    # Passo 1 — projeto resolvido no Postgres da Stack (camada de decisão).
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        row = await c_pg.fetchrow(
             "SELECT projeto_nome, id_int_legado FROM projetos WHERE id = $1",
             projeto_id,
         )
@@ -282,10 +304,14 @@ async def get_ranking_history(projeto_id: str, keyword: Optional[str] = None):
 
     projeto_id_int = row["id_int_legado"]
 
+    # Fase 35 / D-02: ranking_history_cache mora no Supabase (schema leadgen).
+    # ADR 2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+    # Uma única conexão do pool do Supabase por handler, fora de qualquer laço (Pitfall 8).
+    lg = await get_lg_pool()
     try:
-        async with pool.acquire() as conn:
+        async with lg.acquire() as c_lg:
             if keyword:
-                rows = await conn.fetch(
+                rows = await c_lg.fetch(
                     """
                     SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
                     FROM ranking_history_cache
@@ -296,7 +322,7 @@ async def get_ranking_history(projeto_id: str, keyword: Optional[str] = None):
                     keyword,
                 )
             else:
-                rows = await conn.fetch(
+                rows = await c_lg.fetch(
                     """
                     SELECT keyword, snapshot_date, serp_position, sc_position_avg_30d
                     FROM ranking_history_cache
@@ -344,9 +370,10 @@ async def get_ranking_report(projeto_id: str):
     - baseline: apenas 1 snapshot_date → sem deltas
     - weekly: 2+ snapshots → deltas calculados
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+    # Passo 1 — projeto resolvido no Postgres da Stack (camada de decisão).
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        row = await c_pg.fetchrow(
             "SELECT projeto_nome, id_int_legado FROM projetos WHERE id = $1",
             projeto_id,
         )
@@ -355,9 +382,12 @@ async def get_ranking_report(projeto_id: str):
 
     projeto_id_int = row["id_int_legado"]
 
+    # Fase 35 / D-02: ranking_history_cache mora no Supabase (schema leadgen).
+    # ADR 2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+    lg = await get_lg_pool()
     try:
-        async with pool.acquire() as conn:
-            hist_rows = await conn.fetch(
+        async with lg.acquire() as c_lg:
+            hist_rows = await c_lg.fetch(
                 """
                 SELECT keyword, snapshot_date, serp_position,
                        sc_position_avg_30d, sc_impressions_30d, status
