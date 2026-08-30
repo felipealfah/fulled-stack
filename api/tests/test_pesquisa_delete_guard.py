@@ -202,15 +202,23 @@ async def _contar(lg_conn, pesquisa_id: str) -> dict[str, int]:
     }
 
 
-async def _cleanup_projeto(db_conn, lg_conn, projeto_id: str):
-    """Teardown incondicional — nos DOIS bancos, mesmo se o teste falhou."""
-    pesquisas = [
+async def _cleanup_projeto(db_conn, lg_conn, projeto_id: str, *pesquisa_ids: str):
+    """Teardown incondicional — nos DOIS bancos, mesmo se o teste falhou.
+
+    Os `pesquisa_ids` são passados explicitamente porque o endpoint sob teste já pode ter
+    apagado a linha de `pesquisas` no Postgres: descobrir os filhos por
+    `WHERE projeto_id_uuid = ...` devolveria vazio e o teardown vazaria linhas no Supabase.
+    Foi o que aconteceu numa rodada de mutação — uma linha de `kw_scorecard` sobreviveu à
+    suíte. A busca por projeto continua como rede de segurança para o que o teste criou
+    antes de falhar.
+    """
+    descobertas = [
         str(r["id"])
         for r in await db_conn.fetch(
             "SELECT id FROM pesquisas WHERE projeto_id_uuid = $1::uuid", projeto_id,
         )
     ]
-    for pid in pesquisas:
+    for pid in dict.fromkeys([*pesquisa_ids, *descobertas]):
         for tabela in TABELAS_APAGAR:
             await lg_conn.execute(
                 f"DELETE FROM {tabela} WHERE pesquisa_id = $1::uuid", pid,  # noqa: S608
@@ -253,7 +261,7 @@ async def test_delete_projeto_rascunho_hard(db_conn, lg_conn):
         row = await db_conn.fetchrow("SELECT id FROM pesquisas WHERE id = $1::uuid", pid)
         assert row is None, "Pesquisa ainda existe após DELETE"
     finally:
-        await _cleanup_projeto(db_conn, lg_conn, proj_id)
+        await _cleanup_projeto(db_conn, lg_conn, proj_id, pid)
 
 
 @pytest.mark.asyncio
@@ -270,7 +278,7 @@ async def test_delete_guard_projeto_deploy(db_conn, lg_conn):
         row = await db_conn.fetchrow("SELECT id FROM pesquisas WHERE id = $1::uuid", pid)
         assert row is not None, "Pesquisa foi deletada mesmo com guard ativo"
     finally:
-        await _cleanup_projeto(db_conn, lg_conn, proj_id)
+        await _cleanup_projeto(db_conn, lg_conn, proj_id, pid)
 
 
 @pytest.mark.asyncio
@@ -301,7 +309,7 @@ async def test_delete_guard_nao_escreve_em_nenhum_banco(db_conn, lg_conn):
             "SELECT count(*) FROM pesquisas WHERE id = $1::uuid", pid,
         ) == 1
     finally:
-        await _cleanup_projeto(db_conn, lg_conn, proj_id)
+        await _cleanup_projeto(db_conn, lg_conn, proj_id, pid)
 
 
 @pytest.mark.asyncio
@@ -317,7 +325,7 @@ async def test_delete_force_hard_over_deploy(db_conn, lg_conn):
         row = await db_conn.fetchrow("SELECT id FROM pesquisas WHERE id = $1::uuid", pid)
         assert row is None, "Pesquisa ainda existe após DELETE force=true"
     finally:
-        await _cleanup_projeto(db_conn, lg_conn, proj_id)
+        await _cleanup_projeto(db_conn, lg_conn, proj_id, pid)
 
 
 @pytest.mark.asyncio
@@ -361,7 +369,7 @@ async def test_delete_limpa_kws(db_conn, lg_conn):
         )
         assert count_after == 0, f"Ainda existem {count_after} kws após DELETE"
     finally:
-        await _cleanup_projeto(db_conn, lg_conn, proj_id)
+        await _cleanup_projeto(db_conn, lg_conn, proj_id, pid)
 
 
 @pytest.mark.asyncio
@@ -398,7 +406,7 @@ async def test_delete_nao_deixa_orfaos_nas_tabelas_migradas(db_conn, lg_conn):
         )
         assert sobreviventes == 1, f"content_pages foi apagada em vez de nulificada ({sobreviventes})"
     finally:
-        await _cleanup_projeto(db_conn, lg_conn, proj_id)
+        await _cleanup_projeto(db_conn, lg_conn, proj_id, pid)
 
 
 @pytest.mark.asyncio
@@ -425,4 +433,4 @@ async def test_delete_idempotente_apos_falha_parcial(db_conn, lg_conn):
             "SELECT count(*) FROM pesquisas WHERE id = $1::uuid", pid,
         ) == 0
     finally:
-        await _cleanup_projeto(db_conn, lg_conn, proj_id)
+        await _cleanup_projeto(db_conn, lg_conn, proj_id, pid)
