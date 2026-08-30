@@ -4,11 +4,17 @@ Bulk UPDATE com error accumulation. Nunca retorna 500 global — sempre 200
 com `{updated, not_found, invalid}`. Vocabulário difficulty_label canônico
 (D-04): 'LOW', 'MED', 'HIGH' — outros valores vão para invalid[].
 
-Estratégia: seed pesquisa + kw_staging pending no VPS, chama endpoint,
+Estratégia: seed pesquisa + kw_staging pending, chama endpoint,
 valida efeito via SELECT, cleanup no teardown.
 
+## Fase 35 / D-02 — a pesquisa e as keywords vivem em bancos diferentes
+`pesquisas` continua no Postgres da Stack (`pg_conn`); `kw_staging` mora no Supabase,
+schema `leadgen` (`db_conn`). Todo seed, teardown e asserção de estado usa a conexão do
+banco certo. O reset do pool do Supabase vem da fixture autouse do `conftest.py`.
+
 Pré-condições:
-- Túnel VPS Postgres em localhost:5434.
+- Túnel VPS Postgres em localhost:5433 (`bash vps_tunnel.sh -d`).
+- `LEADGEN_DB_URL` no `.env` apontando para o Supavisor session pooler.
 - Migration 017 aplicada (colunas competitive_score/difficulty_label/intel_json em kw_staging).
 - AUTH_ENABLED=false.
 
@@ -19,6 +25,7 @@ Rodar:
 
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -32,6 +39,7 @@ if str(_API_DIR) not in sys.path:
 
 from main import app  # noqa: E402
 import db as db_module  # noqa: E402
+import db_leadgen as lg_module  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -54,40 +62,57 @@ async def _reset_pool_por_teste():
 
 @pytest.fixture
 async def db_conn():
-    dsn = os.environ["DATABASE_URL"]
-    conn = await asyncpg.connect(dsn)
+    """Supabase, schema `leadgen` — é onde `kw_staging` mora desde a Fase 35."""
+    conn = await asyncpg.connect(
+        os.environ["LEADGEN_DB_URL"], server_settings={"search_path": "leadgen"},
+    )
     yield conn
     await conn.close()
 
 
-async def _seed(conn, n=3):
-    """Cria pesquisa + n kw_staging pending. Retorna (pesquisa_id_str, [kw_id_int, ...])."""
+@pytest.fixture
+async def pg_conn():
+    """Postgres da Stack — `pesquisas` é camada de decisão e não migrou."""
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    yield conn
+    await conn.close()
+
+
+async def _seed(pg_conn, lg_conn, n=3):
+    """Cria pesquisa (Postgres) + n kw_staging pending (Supabase).
+
+    Retorna (pesquisa_id_str, [kw_id_int, ...]).
+    """
     suffix = uuid.uuid4().hex[:8]
-    pid = await conn.fetchval(
+    pid = await pg_conn.fetchval(
         """INSERT INTO pesquisas (projeto_nome, nicho, cidade, status, papel)
            VALUES ($1, $2, 'Brasília', 'classificado', 'principal') RETURNING id""",
         f"Test-Bulk-Intel-{suffix}", f"nicho-bulk-{suffix}",
     )
     kw_ids = []
-    for i in range(n):
-        kwid = await conn.fetchval(
+    if n:
+        # Um único INSERT para as n keywords: com o banco do outro lado da internet, um
+        # INSERT por linha faria o seed de 200 itens levar mais tempo que o próprio teste.
+        rows = await lg_conn.fetch(
             """INSERT INTO kw_staging (pesquisa_id, keyword, kw_type, status)
-               VALUES ($1::uuid, $2, 'PAGINA_PRINCIPAL', 'pending') RETURNING id""",
-            pid, f"kw-bulk-{suffix}-{i}",
+               SELECT $1::uuid, k, 'PAGINA_PRINCIPAL', 'pending'
+                 FROM unnest($2::text[]) AS k
+               RETURNING id""",
+            str(pid), [f"kw-bulk-{suffix}-{i}" for i in range(n)],
         )
-        kw_ids.append(kwid)
+        kw_ids = [r["id"] for r in rows]
     return str(pid), kw_ids
 
 
-async def _cleanup(conn, pesquisa_id):
-    await conn.execute("DELETE FROM kw_staging WHERE pesquisa_id = $1::uuid", pesquisa_id)
-    await conn.execute("DELETE FROM pesquisas WHERE id = $1::uuid", pesquisa_id)
+async def _cleanup(pg_conn, lg_conn, pesquisa_id):
+    await lg_conn.execute("DELETE FROM kw_staging WHERE pesquisa_id = $1::uuid", pesquisa_id)
+    await pg_conn.execute("DELETE FROM pesquisas WHERE id = $1::uuid", pesquisa_id)
 
 
 @pytest.mark.asyncio
-async def test_bulk_intel_happy(db_conn):
+async def test_bulk_intel_happy(db_conn, pg_conn):
     """T1: 3 items válidos → updated=3, not_found=[], invalid=[]."""
-    pid, kw_ids = await _seed(db_conn, n=3)
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=3)
     try:
         payload = {"items": [
             {"keyword_id": k, "competitive_score": 50.0, "difficulty_label": "MED",
@@ -110,13 +135,13 @@ async def test_bulk_intel_happy(db_conn):
             assert row["difficulty_label"] == "MED"
             assert row["top_competitor_url"] == "https://x.com/a"
     finally:
-        await _cleanup(db_conn, pid)
+        await _cleanup(pg_conn, db_conn, pid)
 
 
 @pytest.mark.asyncio
-async def test_bulk_intel_error_accumulation(db_conn):
+async def test_bulk_intel_error_accumulation(db_conn, pg_conn):
     """T2 (CRIT-8): 2 válidos + 2 IDs inexistentes + 1 label inválido → 200 com relatório."""
-    pid, kw_ids = await _seed(db_conn, n=2)
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=2)
     try:
         payload = {"items": [
             {"keyword_id": kw_ids[0], "competitive_score": 50.0, "difficulty_label": "MED", "intel_json": {}},
@@ -134,13 +159,13 @@ async def test_bulk_intel_error_accumulation(db_conn):
         assert len(body["invalid"]) == 1, body
         assert body["invalid"][0]["id"] == kw_ids[0]
     finally:
-        await _cleanup(db_conn, pid)
+        await _cleanup(pg_conn, db_conn, pid)
 
 
 @pytest.mark.asyncio
-async def test_bulk_intel_difficulty_label_lowercase_invalid(db_conn):
+async def test_bulk_intel_difficulty_label_lowercase_invalid(db_conn, pg_conn):
     """T3 (D-04): 'baixo'/'médio'/'alto' → invalid[], sem UPDATE."""
-    pid, kw_ids = await _seed(db_conn, n=1)
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=1)
     try:
         payload = {"items": [
             {"keyword_id": kw_ids[0], "competitive_score": 50.0, "difficulty_label": "baixo", "intel_json": {}},
@@ -157,13 +182,13 @@ async def test_bulk_intel_difficulty_label_lowercase_invalid(db_conn):
         row = await db_conn.fetchrow("SELECT difficulty_label FROM kw_staging WHERE id = $1", kw_ids[0])
         assert row["difficulty_label"] is None
     finally:
-        await _cleanup(db_conn, pid)
+        await _cleanup(pg_conn, db_conn, pid)
 
 
 @pytest.mark.asyncio
-async def test_bulk_intel_score_out_of_range(db_conn):
+async def test_bulk_intel_score_out_of_range(db_conn, pg_conn):
     """T4: competitive_score=150 → invalid[]."""
-    pid, kw_ids = await _seed(db_conn, n=1)
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=1)
     try:
         payload = {"items": [
             {"keyword_id": kw_ids[0], "competitive_score": 150.0, "difficulty_label": "MED", "intel_json": {}},
@@ -176,20 +201,20 @@ async def test_bulk_intel_score_out_of_range(db_conn):
         assert len(body["invalid"]) == 1
         assert "score" in body["invalid"][0]["reason"].lower() or "0" in body["invalid"][0]["reason"]
     finally:
-        await _cleanup(db_conn, pid)
+        await _cleanup(pg_conn, db_conn, pid)
 
 
 @pytest.mark.asyncio
-async def test_bulk_intel_empty_payload(db_conn):
+async def test_bulk_intel_empty_payload(db_conn, pg_conn):
     """T5: {items: []} → {updated: 0, not_found: [], invalid: []} (200)."""
-    pid, _ = await _seed(db_conn, n=0)
+    pid, _ = await _seed(pg_conn, db_conn, n=0)
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             r = await c.patch(f"/pesquisas/{pid}/keywords/bulk-intel", json={"items": []})
         assert r.status_code == 200
         assert r.json() == {"updated": 0, "not_found": [], "invalid": []}
     finally:
-        await _cleanup(db_conn, pid)
+        await _cleanup(pg_conn, db_conn, pid)
 
 
 @pytest.mark.asyncio
@@ -203,9 +228,9 @@ async def test_bulk_intel_pesquisa_404():
 
 
 @pytest.mark.asyncio
-async def test_bulk_intel_idempotent(db_conn):
+async def test_bulk_intel_idempotent(db_conn, pg_conn):
     """T7: rerun idêntico → mesmo updated=3 (UPDATE não-destrutivo)."""
-    pid, kw_ids = await _seed(db_conn, n=3)
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=3)
     try:
         payload = {"items": [
             {"keyword_id": k, "competitive_score": 50.0, "difficulty_label": "MED", "intel_json": {"x": 1}}
@@ -218,13 +243,13 @@ async def test_bulk_intel_idempotent(db_conn):
         assert r1.json()["updated"] == 3
         assert r2.json()["updated"] == 3
     finally:
-        await _cleanup(db_conn, pid)
+        await _cleanup(pg_conn, db_conn, pid)
 
 
 @pytest.mark.asyncio
-async def test_bulk_intel_all_canonical_labels(db_conn):
+async def test_bulk_intel_all_canonical_labels(db_conn, pg_conn):
     """T8: LOW, MED, HIGH todos aceitos."""
-    pid, kw_ids = await _seed(db_conn, n=3)
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=3)
     try:
         payload = {"items": [
             {"keyword_id": kw_ids[0], "competitive_score": 20.0, "difficulty_label": "LOW", "intel_json": {}},
@@ -244,4 +269,82 @@ async def test_bulk_intel_all_canonical_labels(db_conn):
         labels = {r["difficulty_label"] for r in rows}
         assert labels == {"LOW", "MED", "HIGH"}
     finally:
-        await _cleanup(db_conn, pid)
+        await _cleanup(pg_conn, db_conn, pid)
+
+
+@pytest.mark.asyncio
+async def test_bulk_intel_lote_grande_em_uma_ida(db_conn, pg_conn):
+    """T9 (Fase 35): lote de 200 itens → updated=200 e tempo de parede < 5 s.
+
+    O limite de tempo é a asserção que importa: o laço item a item que existia antes
+    fazia um round-trip por keyword. Contra o Supabase (internet pública, TLS) 200 idas
+    não cabem em 5 s — só a instrução única em lote cabe.
+
+    Os pools são aquecidos ANTES de começar a contar: a fixture autouse do conftest fecha
+    o pool do Supabase a cada teste, e o handshake TLS de abertura (~3 s) mascararia o que
+    a asserção quer medir, que é o custo do lote em si.
+    """
+    n = 200
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=n)
+    assert len(kw_ids) == n, f"seed devolveu {len(kw_ids)} ids"
+    try:
+        payload = {"items": [
+            {"keyword_id": k, "competitive_score": 42.0, "difficulty_label": "HIGH",
+             "top_competitor_url": f"https://x.com/{k}", "intel_json": {"pos": i}}
+            for i, k in enumerate(kw_ids)
+        ]}
+        await (await db_module.get_pool()).fetchval("SELECT 1")
+        await (await lg_module.get_lg_pool()).fetchval("SELECT 1")
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            inicio = time.perf_counter()
+            r = await c.patch(f"/pesquisas/{pid}/keywords/bulk-intel", json=payload)
+            decorrido = time.perf_counter() - inicio
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["updated"] == n, body
+        assert body["not_found"] == []
+        assert body["invalid"] == []
+        assert decorrido < 5.0, f"lote de {n} levou {decorrido:.2f}s — laço item a item?"
+
+        # O efeito é real no banco, não só na resposta.
+        gravadas = await db_conn.fetchval(
+            """SELECT count(*) FROM kw_staging
+                WHERE id = ANY($1::int[]) AND difficulty_label = 'HIGH'
+                  AND competitive_score = 42.0 AND intel_updated_at IS NOT NULL""",
+            kw_ids,
+        )
+        assert gravadas == n
+    finally:
+        await _cleanup(pg_conn, db_conn, pid)
+
+
+@pytest.mark.asyncio
+async def test_bulk_intel_grava_intel_json_como_objeto(db_conn, pg_conn):
+    """T10: `intel_json` é gravado como objeto JSONB, não como texto JSON.
+
+    Regressão: o handler serializava com `json.dumps` **e** o codec JSONB do pool
+    aplicava `json.dumps` de novo, gravando `"{\\"x\\": 1}"` (jsonb_typeof='string')
+    em vez do objeto. Quem lesse a coluna recebia uma string e o spread quebrava.
+    """
+    pid, kw_ids = await _seed(pg_conn, db_conn, n=1)
+    try:
+        payload = {"items": [
+            {"keyword_id": kw_ids[0], "competitive_score": 10.0,
+             "difficulty_label": "LOW", "intel_json": {"regioes": ["df"], "n": 3}},
+        ]}
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.patch(f"/pesquisas/{pid}/keywords/bulk-intel", json=payload)
+        assert r.status_code == 200, r.text
+        assert r.json()["updated"] == 1
+
+        row = await db_conn.fetchrow(
+            """SELECT jsonb_typeof(intel_json) AS tipo,
+                      intel_json->>'n'        AS n
+                 FROM kw_staging WHERE id = $1""",
+            kw_ids[0],
+        )
+        assert row["tipo"] == "object", f"intel_json gravado como {row['tipo']}"
+        assert row["n"] == "3"
+    finally:
+        await _cleanup(pg_conn, db_conn, pid)
