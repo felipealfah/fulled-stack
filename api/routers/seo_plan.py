@@ -11,6 +11,33 @@ Idempotência (T-14-02): /ready faz SELECT antes de INSERT em agent_executions.
 SQL injection (T-14-03): f-string apenas para nomes de colunas (controlados pelo BaseModel).
 
 Phase 05: projeto_id no path é UUID (str). Queries em tabelas legadas usam id_int_legado.
+
+## Fase 35 / D-02 — o plano SEO mora no Supabase (schema `leadgen`)
+ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+Repartição das tabelas deste arquivo:
+
+  Postgres da Stack (`c_pg`, camada de DECISÃO)  →  projetos, pesquisas, agent_executions
+  Supabase / schema leadgen (`c_lg`, PRÉ-decisão) →  projeto_seo_plan, projeto_seo_plan_pages,
+                                                     projeto_seo_plan_pages_intel, kw_staging,
+                                                     content_pages
+
+Os JOINs `projeto_seo_plan_pages × projeto_seo_plan` e o `LEFT JOIN LATERAL` sobre
+`projeto_seo_plan_pages_intel` NÃO foram tocados: as duas pontas migram juntas, então
+continuam sendo SQL de um banco só. Reescrevê-los seria retrabalho puro.
+
+Duas junções cruzavam a fronteira, ambas em `get_seo_plan`, e foram recompostas em memória:
+  1. `projeto_seo_plan_pages LEFT JOIN pesquisas` → as colunas `pesquisa_nome`/`pesquisa_status`
+     vêm de uma segunda consulta ao Postgres, casada por dicionário. A semântica de LEFT JOIN é
+     preservada: `pesquisa_id` sem correspondência devolve NULL, não erro.
+  2. `pesquisas ... NOT IN (SELECT pesquisa_id FROM projeto_seo_plan_pages)` → a lista do
+     Supabase vira um `set` e o filtro acontece em Python, na ordem que o Postgres devolveu.
+
+Nenhuma query deste arquivo menciona ao mesmo tempo uma tabela do Postgres e uma migrada.
+
+Segurança (T-35-05): sem FK cross-DB, o `_resolve_projeto` no Postgres deixa de ser
+conveniência e vira o único controle de travessia entre projetos — o `plan_id` usado no
+Supabase é sempre derivado do projeto já resolvido, nunca do corpo da request.
 """
 
 from typing import Literal
@@ -19,6 +46,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from db import get_pool
+from db_leadgen import get_lg_pool
+from routers._common import _resolve_projeto
 
 router = APIRouter(prefix="/projetos", tags=["seo-plan"])
 
@@ -47,15 +76,12 @@ def _derive_page_slug(url: str) -> str:
     return url.strip("/").split("/")[-1] or "home"
 
 
-async def _resolve_projeto(conn, projeto_id: str) -> dict:
-    """Resolve UUID para linha do projeto com id_int_legado."""
-    proj = await conn.fetchrow(
-        "SELECT id, id_int_legado FROM projetos WHERE id = $1::uuid",
-        projeto_id,
-    )
-    if not proj:
-        raise HTTPException(404, "Projeto não encontrado")
-    return dict(proj)
+# Fase 35 / D-02: `_resolve_projeto` era duplicado aqui e em `_common.py` — o docstring
+# de `_common.py` existe justamente para dizer que este era o original extraído. Como
+# todos os handlers deste arquivo passaram a ser de dois passos, a cópia local sai (dívida
+# D-35-03-03). A versão compartilhada é idêntica mais um branch de 422 para UUID malformado:
+# antes desta unificação, `GET /projetos/nao-eh-uuid/seo-plan` estourava `asyncpg.DataError`
+# não tratado (500). Medido antes da mudança; `content.py` já respondia 422 no mesmo caso.
 
 
 # ---------------------------------------------------------------------------
@@ -64,12 +90,18 @@ async def _resolve_projeto(conn, projeto_id: str) -> dict:
 
 @router.get("/{projeto_id}/seo-plan")
 async def get_seo_plan(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        proj = await _resolve_projeto(conn, projeto_id)
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
         pid_int = proj["id_int_legado"]
 
-        plan_row = await conn.fetchrow(
+    # T-35-05: o pool do Supabase só é tocado DEPOIS de o projeto existir no Postgres.
+    # `get_lg_pool()` abre conexão na primeira chamada, então antecipá-lo faria 404 e 422
+    # dependerem do Supabase estar de pé — e a ordem "Postgres antes do Supabase" deixaria
+    # de ser observável de fora, que é como o Plan 35-03 a comprova.
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg, lg.acquire() as c_lg:
+        plan_row = await c_lg.fetchrow(
             "SELECT * FROM projeto_seo_plan WHERE projeto_id = $1", pid_int
         )
         if not plan_row:
@@ -77,7 +109,12 @@ async def get_seo_plan(projeto_id: str):
 
         plan = dict(plan_row)
 
-        pages_rows = await conn.fetch(
+        # Fase 35 / D-02: o `LEFT JOIN pesquisas` saiu daqui — `pesquisas` é camada de
+        # decisão e ficou no Postgres. As duas colunas continuam sendo selecionadas como
+        # NULL na MESMA posição para que a ordem das chaves do payload não mude; os
+        # valores chegam logo abaixo, do Postgres. O `LEFT JOIN kw_staging` e o
+        # `LEFT JOIN LATERAL` de intel ficam intactos: as duas pontas moram no Supabase.
+        pages_rows = await c_lg.fetch(
             """
             SELECT
               p.id,
@@ -90,13 +127,12 @@ async def get_seo_plan(projeto_id: str):
               p.difficulty_label,
               p.top_competitor_url,
               p.intel_updated_at,
-              pes.nicho           AS pesquisa_nome,
-              pes.status          AS pesquisa_status,
+              NULL::text          AS pesquisa_nome,
+              NULL::text          AS pesquisa_status,
               kw.keyword          AS kw_principal_text,
               kw.avg_monthly_searches AS kw_principal_volume,
               latest_intel.intel_data
             FROM projeto_seo_plan_pages p
-            LEFT JOIN pesquisas pes ON pes.id = p.pesquisa_id
             LEFT JOIN kw_staging kw ON kw.id = p.kw_principal_id
             LEFT JOIN LATERAL (
               SELECT intel_data FROM projeto_seo_plan_pages_intel pi
@@ -109,10 +145,28 @@ async def get_seo_plan(projeto_id: str):
             plan["id"],
         )
 
-        pages = []
-        for page_row in pages_rows:
-            page = dict(page_row)
-            kws = await conn.fetch(
+        pages = [dict(r) for r in pages_rows]
+
+        # Fase 35 / D-02: a ponta Postgres do LEFT JOIN, em UMA consulta em lote.
+        # `= ANY($1::uuid[])` com parâmetro posicional — concatenar ids em string é
+        # proibido (T-35-06). `.get()` em vez de indexação preserva a semântica do
+        # LEFT JOIN: pesquisa_id que não existe mais no Postgres devolve NULL nas duas
+        # colunas, como antes, em vez de estourar KeyError.
+        pesquisa_ids = list({p["pesquisa_id"] for p in pages if p["pesquisa_id"]})
+        pesquisas_por_id = {}
+        if pesquisa_ids:
+            pes_rows = await c_pg.fetch(
+                "SELECT id::text AS id, nicho, status FROM pesquisas WHERE id = ANY($1::uuid[])",
+                pesquisa_ids,
+            )
+            pesquisas_por_id = {r["id"]: r for r in pes_rows}
+
+        for page in pages:
+            pes = pesquisas_por_id.get(page["pesquisa_id"])
+            page["pesquisa_nome"] = pes["nicho"] if pes else None
+            page["pesquisa_status"] = pes["status"] if pes else None
+
+            kws = await c_lg.fetch(
                 """
                 SELECT id, keyword, avg_monthly_searches
                 FROM kw_staging
@@ -122,23 +176,33 @@ async def get_seo_plan(projeto_id: str):
                 page["pesquisa_id"],
             )
             page["keywords"] = [dict(k) for k in kws]
-            pages.append(page)
 
-        sem_plano = await conn.fetch(
+        # Fase 35 / D-02: a SEGUNDA junção cross-fronteira do arquivo (o plano só previa a
+        # de cima). Era `pesquisas ... AND id NOT IN (SELECT pesquisa_id FROM
+        # projeto_seo_plan_pages ...)`. O `IS NOT NULL` da subconsulta original continua
+        # aqui — é ele que evita a semântica de NOT IN com NULL. A ordem final é a que o
+        # Postgres devolve, exatamente como antes (a query nunca teve ORDER BY).
+        gate2_rows = await c_pg.fetch(
             """
             SELECT id::text FROM pesquisas
             WHERE projeto_id = $1
               AND status = 'gate_2_approved'
-              AND id NOT IN (
-                SELECT pesquisa_id FROM projeto_seo_plan_pages
-                WHERE plan_id = $2 AND pesquisa_id IS NOT NULL
-              )
             """,
             pid_int,
-            plan["id"],
         )
+        ja_no_plano = {
+            r["pesquisa_id"]
+            for r in await c_lg.fetch(
+                """
+                SELECT pesquisa_id::text AS pesquisa_id FROM projeto_seo_plan_pages
+                WHERE plan_id = $1 AND pesquisa_id IS NOT NULL
+                """,
+                plan["id"],
+            )
+        }
+        sem_plano = [r["id"] for r in gate2_rows if r["id"] not in ja_no_plano]
 
-        exec_row = await conn.fetchrow(
+        exec_row = await c_pg.fetchrow(
             """SELECT id FROM agent_executions
                WHERE projeto_id = $1
                  AND agent_name = 'competitive_intel'
@@ -147,7 +211,7 @@ async def get_seo_plan(projeto_id: str):
         )
 
         plan["pages"] = pages
-        plan["pesquisas_sem_plano"] = [r["id"] for r in sem_plano]
+        plan["pesquisas_sem_plano"] = sem_plano
         plan["competitive_intel_pending"] = exec_row is not None
         return plan
 
@@ -158,35 +222,40 @@ async def get_seo_plan(projeto_id: str):
 
 @router.post("/{projeto_id}/seo-plan/generate")
 async def generate_seo_plan(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        proj = await _resolve_projeto(conn, projeto_id)
+    # Fase 35 / D-02: `pesquisas` no Postgres, plano e páginas no Supabase — cada query
+    # fala com um banco só. O laço de INSERT itera sobre as pesquisas do projeto (unidades,
+    # não entrada de cliente) e roda numa conexão única, fora de qualquer `acquire()`.
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
         pid_int = proj["id_int_legado"]
 
-        pesquisas = await conn.fetch(
+    lg = await get_lg_pool()  # T-35-05: só depois de o projeto existir no Postgres
+    async with pg.acquire() as c_pg, lg.acquire() as c_lg:
+        pesquisas = await c_pg.fetch(
             """SELECT id::text, papel FROM pesquisas
                WHERE projeto_id = $1 AND status IN ('gate_2_approved', 'aprovado')
                ORDER BY created_at""",
             pid_int,
         )
 
-        plan_row = await conn.fetchrow(
+        plan_row = await c_lg.fetchrow(
             "SELECT id FROM projeto_seo_plan WHERE projeto_id = $1", pid_int
         )
         if plan_row:
             plan_id = plan_row["id"]
-            await conn.execute(
+            await c_lg.execute(
                 "UPDATE projeto_seo_plan SET updated_at = NOW() WHERE id = $1", plan_id
             )
         else:
-            plan_id = await conn.fetchval(
+            plan_id = await c_lg.fetchval(
                 """INSERT INTO projeto_seo_plan (projeto_id, status)
                    VALUES ($1, 'rascunho') RETURNING id""",
                 pid_int,
             )
 
         for p in pesquisas:
-            await conn.execute(
+            await c_lg.execute(
                 """INSERT INTO projeto_seo_plan_pages (plan_id, pesquisa_id, papel)
                    VALUES ($1, $2::uuid, $3)
                    ON CONFLICT (plan_id, pesquisa_id) DO NOTHING""",
@@ -209,13 +278,18 @@ class SeoPlanPageUpdate(BaseModel):
 
 @router.patch("/{projeto_id}/seo-plan/pages/{page_id}")
 async def update_seo_plan_page(projeto_id: str, page_id: int, body: SeoPlanPageUpdate):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        proj = await _resolve_projeto(conn, projeto_id)
+    # Fase 35 / D-02: o JOIN `projeto_seo_plan_pages × projeto_seo_plan` NÃO foi tocado —
+    # as duas tabelas migraram juntas, então continua sendo SQL de um banco só.
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
         pid_int = proj["id_int_legado"]
 
+    # T-35-05: o pool do Supabase só é tocado DEPOIS de o projeto existir no Postgres.
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
         # T-14-01: Validar que page pertence ao projeto (evitar PATCH cross-projeto)
-        row = await conn.fetchrow(
+        row = await c_lg.fetchrow(
             """SELECT p.id FROM projeto_seo_plan_pages p
                JOIN projeto_seo_plan sp ON sp.id = p.plan_id
                WHERE p.id = $1 AND sp.projeto_id = $2""",
@@ -237,12 +311,15 @@ async def update_seo_plan_page(projeto_id: str, page_id: int, body: SeoPlanPageU
             values.append(v)
 
         set_clause = ", ".join(set_parts)
-        await conn.execute(
-            f"UPDATE projeto_seo_plan_pages SET {set_clause} WHERE id = $1",
+        await c_lg.execute(
+            # noqa: S608 — o f-string interpola apenas NOMES DE COLUNA vindos do
+            # SeoPlanPageUpdate (BaseModel), nunca valores; os valores seguem em $1..$N.
+            # Mesma exceção que o CLAUDE.md do projeto prevê e que kw_mgmt.py já usa.
+            f"UPDATE projeto_seo_plan_pages SET {set_clause} WHERE id = $1",  # noqa: S608
             *values,
         )
 
-        await conn.execute(
+        await c_lg.execute(
             """UPDATE projeto_seo_plan SET updated_at = NOW()
                WHERE id = (SELECT plan_id FROM projeto_seo_plan_pages WHERE id = $1)""",
             page_id,
@@ -258,24 +335,28 @@ async def update_seo_plan_page(projeto_id: str, page_id: int, body: SeoPlanPageU
 
 @router.patch("/{projeto_id}/seo-plan/ready")
 async def mark_seo_plan_ready(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        proj = await _resolve_projeto(conn, projeto_id)
+    # Fase 35 / D-02: `projeto_seo_plan` no Supabase; `pesquisas` e `agent_executions`
+    # (camada de decisão) seguem no Postgres. Nenhuma query mistura os dois.
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
         pid_int = proj["id_int_legado"]
 
-        plan_row = await conn.fetchrow(
+    lg = await get_lg_pool()  # T-35-05: só depois de o projeto existir no Postgres
+    async with pg.acquire() as c_pg, lg.acquire() as c_lg:
+        plan_row = await c_lg.fetchrow(
             "SELECT id FROM projeto_seo_plan WHERE projeto_id = $1", pid_int
         )
         if not plan_row:
             raise HTTPException(404, "Plano SEO não encontrado")
 
-        await conn.execute(
+        await c_lg.execute(
             "UPDATE projeto_seo_plan SET status = 'pronto', updated_at = NOW() WHERE projeto_id = $1",
             pid_int,
         )
 
         # T-14-02: Idempotente — verificar antes de inserir
-        existing = await conn.fetchrow(
+        existing = await c_pg.fetchrow(
             """SELECT id FROM agent_executions
                WHERE projeto_id = $1
                  AND agent_name = 'competitive_intel'
@@ -285,7 +366,7 @@ async def mark_seo_plan_ready(projeto_id: str):
 
         exec_id = None
         if not existing:
-            pesquisa_row = await conn.fetchrow(
+            pesquisa_row = await c_pg.fetchrow(
                 """SELECT id FROM pesquisas
                    WHERE projeto_id = $1 AND status = 'gate_2_approved'
                    ORDER BY created_at LIMIT 1""",
@@ -295,7 +376,7 @@ async def mark_seo_plan_ready(projeto_id: str):
                 print(f"[seo_plan] sem pesquisas gate_2_approved para projeto_id={pid_int}, competitive_intel não enfileirado", flush=True)
                 return {"ok": True, "agent_executions_id": None}
 
-            exec_id = await conn.fetchval(
+            exec_id = await c_pg.fetchval(
                 """INSERT INTO agent_executions
                    (projeto_id, pesquisa_id, analysis_version, agent_name, status, started_at)
                    VALUES ($1, $2, 1, 'competitive_intel', 'pending', NOW())
@@ -329,13 +410,18 @@ async def update_seo_plan_page_intel(projeto_id: str, page_id: int, body: SeoPla
     if body.difficulty_label not in ("baixo", "médio", "alto"):
         raise HTTPException(400, "difficulty_label deve ser 'baixo', 'médio' ou 'alto'")
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        proj = await _resolve_projeto(conn, projeto_id)
+    # Fase 35 / D-02: `projeto_seo_plan_pages` e `projeto_seo_plan_pages_intel` migraram
+    # juntas — o JOIN de validação continua sendo SQL de um banco só, sem uma linha alterada.
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
         pid_int = proj["id_int_legado"]
 
+    # T-35-05: o pool do Supabase só é tocado DEPOIS de o projeto existir no Postgres.
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
         # T-15-01: Validar que page pertence ao projeto (evitar PATCH cross-projeto)
-        row = await conn.fetchrow(
+        row = await c_lg.fetchrow(
             """SELECT p.id FROM projeto_seo_plan_pages p
                JOIN projeto_seo_plan sp ON sp.id = p.plan_id
                WHERE p.id = $1 AND sp.projeto_id = $2""",
@@ -344,7 +430,7 @@ async def update_seo_plan_page_intel(projeto_id: str, page_id: int, body: SeoPla
         if not row:
             raise HTTPException(404, "Página do plano não encontrada")
 
-        await conn.execute(
+        await c_lg.execute(
             """UPDATE projeto_seo_plan_pages
                SET competitive_score  = $2,
                    difficulty_label   = $3,
@@ -357,7 +443,7 @@ async def update_seo_plan_page_intel(projeto_id: str, page_id: int, body: SeoPla
             body.top_competitor_url,
         )
 
-        await conn.execute(
+        await c_lg.execute(
             """INSERT INTO projeto_seo_plan_pages_intel
                (page_id, competitive_score, difficulty_label, top_competitor_url, intel_data)
                VALUES ($1, $2, $3, $4, $5)""",
@@ -378,14 +464,23 @@ async def update_seo_plan_page_intel(projeto_id: str, page_id: int, body: SeoPla
 
 @router.post("/{projeto_id}/seo-plan/populate-intel")
 async def populate_intel(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        proj = await _resolve_projeto(conn, projeto_id)
+    # Fase 35 / D-02: `kw_staging` e `projeto_seo_plan_pages` migraram juntas, então o laço
+    # inteiro é single-DB — não há composição cross-DB a fazer aqui. O que muda é a
+    # DISTÂNCIA: o que era round-trip local virou round-trip pela internet. Daí a exigência
+    # de UMA conexão do pool do Supabase (`acquire()` fora do laço, Pitfall 8) com a
+    # transação existente envolvendo o laço inteiro. O custo está medido em
+    # `test_populate_intel_lote_grande_dentro_do_limite` (≥ 30 páginas, limite de 5 s).
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
         pid_int = proj["id_int_legado"]
         if pid_int is None:
             raise HTTPException(422, "Projeto sem id_int_legado — não há seo_plan associado")
 
-        pages = await conn.fetch(
+    # T-35-05: o pool do Supabase só é tocado DEPOIS de o projeto existir no Postgres.
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        pages = await c_lg.fetch(
             """SELECT p.id AS page_id, p.pesquisa_id, p.kw_principal_id
                FROM projeto_seo_plan_pages p
                JOIN projeto_seo_plan sp ON sp.id = p.plan_id
@@ -399,39 +494,39 @@ async def populate_intel(projeto_id: str):
         pages_updated = 0
         pages_sem_intel: list[int] = []
 
-        async with conn.transaction():
-            for pg in pages:
-                if pg["kw_principal_id"] is not None:
-                    intel = await conn.fetchrow(
+        async with c_lg.transaction():
+            for page in pages:
+                if page["kw_principal_id"] is not None:
+                    intel = await c_lg.fetchrow(
                         "SELECT competitive_score, difficulty_label, top_competitor_url FROM kw_staging WHERE id = $1",
-                        pg["kw_principal_id"],
+                        page["kw_principal_id"],
                     )
                 else:
-                    intel = await conn.fetchrow(
+                    intel = await c_lg.fetchrow(
                         """SELECT competitive_score, difficulty_label, top_competitor_url
                            FROM kw_staging
                            WHERE pesquisa_id = $1 AND competitive_score IS NOT NULL
                            ORDER BY competitive_score DESC NULLS LAST
                            LIMIT 1""",
-                        pg["pesquisa_id"],
+                        page["pesquisa_id"],
                     )
 
                 if intel is None or intel["competitive_score"] is None:
-                    pages_sem_intel.append(pg["page_id"])
+                    pages_sem_intel.append(page["page_id"])
                     continue
 
                 mapped_difficulty = CANONICAL_TO_PT_DIFFICULTY.get(
                     intel["difficulty_label"], intel["difficulty_label"]
                 )
 
-                await conn.execute(
+                await c_lg.execute(
                     """UPDATE projeto_seo_plan_pages
                        SET competitive_score = $2,
                            difficulty_label = $3,
                            top_competitor_url = $4,
                            intel_updated_at = NOW()
                        WHERE id = $1""",
-                    pg["page_id"],
+                    page["page_id"],
                     int(intel["competitive_score"]) if intel["competitive_score"] is not None else None,
                     mapped_difficulty,
                     intel["top_competitor_url"],
@@ -467,15 +562,21 @@ class SyncPagesRequest(BaseModel):
 
 @router.put("/{projeto_id}/seo-plan/pages/sync")
 async def sync_seo_plan_pages(projeto_id: str, body: SyncPagesRequest):
+    # Fase 35 / D-02: este handler grava em `content_pages`, migrada no Plan 35-01. Enquanto
+    # ele continuasse no pool do Postgres, o sync escrevia num banco e o `content.py` lia do
+    # outro — divergência silenciosa em produção. Agora as duas pontas falam com o Supabase.
     import uuid as _uuid
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        proj = await _resolve_projeto(conn, projeto_id)
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
         pid_int = proj["id_int_legado"]
         if pid_int is None:
             raise HTTPException(422, "Projeto sem id_int_legado — impossível gravar em content_pages")
         projeto_uuid_str = str(proj["id"])
 
+    # T-35-05: o pool do Supabase só é tocado DEPOIS de o projeto existir no Postgres.
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
         invalid: list[dict] = []
         valid: list[dict] = []
 
@@ -516,9 +617,9 @@ async def sync_seo_plan_pages(projeto_id: str, body: SyncPagesRequest):
         updated = 0
         archived = 0
 
-        async with conn.transaction():
+        async with c_lg.transaction():
             for v in valid:
-                row = await conn.fetchrow(
+                row = await c_lg.fetchrow(
                     """INSERT INTO content_pages (
                          projeto_id, projeto_id_uuid, page_slug, page_type,
                          url, titulo, meta_description, h1, kw_type, keyword_primaria,
@@ -556,7 +657,7 @@ async def sync_seo_plan_pages(projeto_id: str, body: SyncPagesRequest):
 
             if body.replace and valid:
                 payload_urls = [v["url"] for v in valid]
-                result = await conn.execute(
+                result = await c_lg.execute(
                     """UPDATE content_pages
                           SET arquivada = true, updated_at = NOW()
                         WHERE projeto_id = $1
