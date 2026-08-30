@@ -100,6 +100,142 @@ class PesquisaCreate(BaseModel):
     skip_descarta: bool = True  # não insere kw_staging com kw_type=DESCARTA
 
 
+# ── Fase 35 / D-02 — as duas queries de promoção, recompostas em memória ──────────
+# ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+#
+# As duas eram `kw_staging JOIN pesquisas` (a segunda também `LEFT JOIN projetos`).
+# `kw_staging` está no Supabase e `pesquisas`/`projetos` continuam no Postgres: o JOIN
+# deixou de ser possível e vira UMA consulta de cada lado, casadas em memória.
+#
+# As colunas que vinham do JOIN continuam sendo selecionadas **na posição original** do
+# SELECT, como NULL tipado, e são preenchidas depois. A ordem das chaves de cada linha é
+# contrato observável (é ela que alimenta o dict de `rows_bq`), então não pode mudar.
+#
+# ⚠️ DOIS bugs pré-existentes corrigidos aqui, sem os quais nenhuma das duas queries
+# executa (as duas levantam 500 em produção HOJE — medido contra o Postgres da VPS):
+#   1. `ks.cpc_low_brl` / `ks.cpc_high_brl` não existem: a migration 016 as renomeou
+#      para `bid_pos5_8_brl` / `bid_pos1_4_brl` e `review.py` nunca foi atualizado.
+#      O alias devolve o nome antigo — é o nome do campo no schema do BigQuery, que
+#      NÃO muda.
+#   2. `LEFT JOIN projetos proj ON proj.id = p.projeto_id` compara `uuid = integer`
+#      (`UndefinedFunctionError`): desde a Phase 05 o vínculo UUID é `projeto_id_uuid`.
+_SQL_KW_PROMOCAO_GATE2 = """
+    SELECT
+        ks.keyword,
+        ks.avg_monthly_searches,
+        ks.competition,
+        ks.competition_index,
+        ks.bid_pos5_8_brl  AS cpc_low_brl,
+        ks.bid_pos1_4_brl  AS cpc_high_brl,
+        ks.score           AS opportunity_score,
+        ks.go_nogo         AS recomendacao,
+        ks.go_nogo         AS board_go_nogo,
+        ks.board_note,
+        ks.kw_type         AS tipo,
+        NULL::text         AS pesquisa_id,
+        NULL::text         AS nicho,
+        NULL::text         AS cidade,
+        NULL::text         AS geo_target_id,
+        NULL::timestamptz  AS pesquisado_em,
+        NULL::text         AS projeto_nome,
+        NULL::text         AS projeto_url
+    FROM kw_staging ks
+    WHERE ks.pesquisa_id = $1::uuid
+      AND UPPER(COALESCE(ks.kw_type, '')) != 'DESCARTA'
+"""
+
+_SQL_KW_PROMOCAO_GOLD = """
+    SELECT
+        ks.keyword,
+        ks.avg_monthly_searches,
+        ks.competition,
+        ks.competition_index,
+        ks.bid_pos5_8_brl  AS cpc_low_brl,
+        ks.bid_pos1_4_brl  AS cpc_high_brl,
+        ks.score           AS opportunity_score,
+        ks.go_nogo         AS recomendacao,
+        ks.kw_type         AS tipo,
+        ks.competitive_score,
+        ks.difficulty_label,
+        ks.board_note,
+        NULL::text         AS pesquisa_id,
+        NULL::text         AS nicho,
+        NULL::text         AS cidade,
+        NULL::text         AS geo_target_id,
+        NULL::text         AS projeto_nome,
+        NULL::text         AS projeto_url
+    FROM kw_staging ks
+    WHERE ks.pesquisa_id = $1::uuid
+      AND UPPER(COALESCE(ks.kw_type, '')) != 'DESCARTA'
+"""
+
+# A linha da pesquisa (+ o domínio do projeto) que o JOIN fornecia, agora do Postgres.
+# O LEFT JOIN é preservado como LEFT JOIN: pesquisa sem projeto continua produzindo
+# `projeto_url = None`, nunca um KeyError e nunca uma linha a menos.
+_SQL_PESQUISA_PROMOCAO = """
+    SELECT p.id::text AS pesquisa_id, p.nicho, p.cidade, p.geo_target_id,
+           p.projeto_nome, p.created_at AS pesquisado_em,
+           proj.metadata->>'dominio' AS projeto_url
+      FROM pesquisas p
+      LEFT JOIN projetos proj ON proj.id = p.projeto_id_uuid
+     WHERE p.id = $1::uuid
+"""
+
+
+async def _kw_promocao(pesquisa_id: str, sql_kw: str, *, com_projeto_url: bool) -> list[dict]:
+    """Recompõe em memória o que o JOIN cross-fronteira devolvia.
+
+    Postgres primeiro (a pesquisa é a resolução; sem ela não há o que promover),
+    Supabase depois — a mesma ordem de todos os handlers da fase.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as c_pg:
+        pesquisa = await c_pg.fetchrow(_SQL_PESQUISA_PROMOCAO, pesquisa_id)
+    if not pesquisa:
+        # O JOIN (INNER, sobre pesquisas) já devolvia zero linhas neste caso.
+        return []
+
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        kw_rows = await c_lg.fetch(sql_kw, pesquisa_id)
+
+    # `projeto_url` da query do Gate 2 sempre foi `NULL::text` literal — só a de gold
+    # traz o domínio do projeto.
+    do_join = {
+        "pesquisa_id": pesquisa["pesquisa_id"],
+        "nicho": pesquisa["nicho"],
+        "cidade": pesquisa["cidade"],
+        "geo_target_id": pesquisa["geo_target_id"],
+        "pesquisado_em": pesquisa["pesquisado_em"],
+        "projeto_nome": pesquisa["projeto_nome"],
+        "projeto_url": pesquisa["projeto_url"] if com_projeto_url else None,
+    }
+    return [
+        {k: (do_join[k] if k in do_join else v) for k, v in dict(r).items()}
+        for r in kw_rows
+    ]
+
+
+async def _kw_gate2(pesquisa_id: str) -> list[dict]:
+    """Keywords não-DESCARTA da pesquisa, no formato do espelho silver.kw_plan."""
+    return await _kw_promocao(
+        pesquisa_id, _SQL_KW_PROMOCAO_GATE2, com_projeto_url=False
+    )
+
+
+async def _kw_gold(pesquisa_id: str, _sem_filtro_go: bool = False) -> list[dict]:
+    """Keywords GO da pesquisa, no formato do gold.kw_plan.
+
+    `_sem_filtro_go` existe só para a conferência de paridade da Fase 35: hoje as 382
+    linhas de `kw_staging` têm `go_nogo` NULL, então com o filtro nenhuma linha volta e
+    a recomposição em memória não seria exercida por dado real. Nenhum handler usa.
+    """
+    sql = _SQL_KW_PROMOCAO_GOLD
+    if not _sem_filtro_go:
+        sql += "      AND ks.go_nogo = 'GO'\n"
+    return await _kw_promocao(pesquisa_id, sql, com_projeto_url=True)
+
+
 @router.post("/")
 async def create_pesquisa(body: PesquisaCreate):
     """Cria a pesquisa no Postgres e as keywords no Supabase, nessa ordem.
@@ -431,35 +567,8 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
     # Gravar keywords aprovadas em BQ leadgen_silver.kw_plan (espelho — Postgres é fonte de verdade)
     bq = _get_bq_client()
     if bq:
-        async with pool.acquire() as conn2:
-            kw_rows = await conn2.fetch(
-                """
-                SELECT
-                    ks.keyword,
-                    ks.avg_monthly_searches,
-                    ks.competition,
-                    ks.competition_index,
-                    ks.cpc_low_brl,
-                    ks.cpc_high_brl,
-                    ks.score           AS opportunity_score,
-                    ks.go_nogo         AS recomendacao,
-                    ks.go_nogo         AS board_go_nogo,
-                    ks.board_note,
-                    ks.kw_type         AS tipo,
-                    p.id::text         AS pesquisa_id,
-                    p.nicho,
-                    p.cidade,
-                    p.geo_target_id,
-                    p.created_at       AS pesquisado_em,
-                    p.projeto_nome,
-                    NULL::text         AS projeto_url
-                FROM kw_staging ks
-                JOIN pesquisas p ON p.id = ks.pesquisa_id
-                WHERE ks.pesquisa_id = $1
-                  AND UPPER(COALESCE(ks.kw_type, '')) != 'DESCARTA'
-                """,
-                pesquisa_id,
-            )
+        # Fase 35 / D-02: o JOIN cross-fronteira virou duas consultas casadas em memória.
+        kw_rows = await _kw_gate2(pesquisa_id)
 
         promovido_em = datetime.now(timezone.utc).isoformat()
         rows_bq = []
@@ -676,36 +785,10 @@ async def promote_gold(pesquisa_id: str):
                 "— realize o Gate 1 (approve-gate2) antes de promover para gold",
             )
 
-        kw_rows = await conn.fetch(
-            """
-            SELECT
-                ks.keyword,
-                ks.avg_monthly_searches,
-                ks.competition,
-                ks.competition_index,
-                ks.cpc_low_brl,
-                ks.cpc_high_brl,
-                ks.score            AS opportunity_score,
-                ks.go_nogo          AS recomendacao,
-                ks.kw_type          AS tipo,
-                ks.competitive_score,
-                ks.difficulty_label,
-                ks.board_note,
-                p.id::text          AS pesquisa_id,
-                p.nicho,
-                p.cidade,
-                p.geo_target_id,
-                p.projeto_nome,
-                proj.metadata->>'dominio' AS projeto_url
-            FROM kw_staging ks
-            JOIN pesquisas p ON p.id = ks.pesquisa_id
-            LEFT JOIN projetos proj ON proj.id = p.projeto_id
-            WHERE ks.pesquisa_id = $1
-              AND UPPER(COALESCE(ks.kw_type, '')) != 'DESCARTA'
-              AND ks.go_nogo = 'GO'
-            """,
-            pesquisa_id,
-        )
+    # Fase 35 / D-02: o JOIN cross-fronteira (que também alcançava `projetos`) virou
+    # duas consultas casadas em memória. Fora do `async with` acima — o helper abre a
+    # própria conexão em cada banco.
+    kw_rows = await _kw_gold(pesquisa_id)
 
     aprovado_em = datetime.now(timezone.utc).isoformat()
     rows_bq = []
@@ -759,11 +842,39 @@ async def promote_gold(pesquisa_id: str):
 
 @router.get("/")
 async def list_pesquisas():
+    """As 50 pesquisas mais recentes, com a contagem de keywords de cada uma.
+
+    Fase 35 / D-02: o `LEFT JOIN kw_staging` + `COUNT`/`GROUP BY` não cabe mais numa
+    consulta só. As pesquisas vêm do Postgres com o `ORDER BY`/`LIMIT` intactos, a
+    contagem vem do Supabase em UM round-trip (`= ANY($1::uuid[])`, nunca lista
+    concatenada — T-35-06) e as duas se casam por dicionário.
+
+    Dois round-trips com casamento em memória é precedente aceito no repo para
+    agregação que não cabe numa consulta só (`fetchOfertasCounts` do LowTicket).
+
+    `total_keywords` continua sendo a ÚLTIMA chave de cada linha e continua inteiro:
+    pesquisa sem keyword devolve `0`, que é o que o `LEFT JOIN` + `COUNT` produzia —
+    não `None`.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT p.*, COUNT(k.id) as total_keywords FROM pesquisas p "
-            "LEFT JOIN kw_staging k ON k.pesquisa_id = p.id "
-            "GROUP BY p.id ORDER BY p.created_at DESC LIMIT 50"
+            "SELECT p.* FROM pesquisas p ORDER BY p.created_at DESC LIMIT 50"
         )
-    return [dict(r) for r in rows]
+
+    contagem: dict[str, int] = {}
+    if rows:
+        lg = await get_lg_pool()
+        async with lg.acquire() as c_lg:
+            totais = await c_lg.fetch(
+                """SELECT pesquisa_id, COUNT(*) AS total
+                     FROM kw_staging
+                    WHERE pesquisa_id = ANY($1::uuid[])
+                    GROUP BY pesquisa_id""",
+                [r["id"] for r in rows],
+            )
+        contagem = {str(t["pesquisa_id"]): t["total"] for t in totais}
+
+    return [
+        {**dict(r), "total_keywords": contagem.get(str(r["id"]), 0)} for r in rows
+    ]

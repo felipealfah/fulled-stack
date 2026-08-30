@@ -469,3 +469,47 @@ async def test_delete_keyword_de_outra_pesquisa_404_e_nao_apaga(
     finally:
         await _cleanup_pesquisa_por_nicho(payload_a["nicho"])
         await _cleanup_pesquisa_por_nicho(payload_b["nicho"])
+
+
+@pytest.mark.asyncio
+async def test_list_pesquisas_conta_keywords_do_supabase(
+    unique_pesquisa_payload_com_projeto,
+):
+    """GET /pesquisas/ casa Postgres × Supabase e devolve 0 para pesquisa sem keyword.
+
+    Fase 35 / D-02: o COUNT/GROUP BY saiu do SQL. O caso que o `LEFT JOIN` cobria de
+    graça — pesquisa **sem nenhuma keyword** — é o que o casamento em memória erra com
+    mais facilidade, devolvendo `None` (ou nem a chave) em vez do `0` de antes.
+    """
+    com_kw = unique_pesquisa_payload_com_projeto
+    suffix = uuid.uuid4().hex[:8]
+    sem_kw = {
+        **com_kw,
+        "nicho": f"nicho-conflict-vazia-{suffix}",
+        "keywords": [],
+    }
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r1 = await c.post("/pesquisas/", json=com_kw)
+            r2 = await c.post("/pesquisas/", json=sem_kw)
+            assert r1.status_code == 200 and r2.status_code == 200, (r1.text, r2.text)
+            id_com, id_sem = r1.json()["pesquisa"]["id"], r2.json()["pesquisa"]["id"]
+
+            lst = await c.get("/pesquisas/")
+            assert lst.status_code == 200, lst.text
+            linhas = {row["id"]: row for row in lst.json()}
+
+        assert linhas[id_com]["total_keywords"] == 1
+        # o LEFT JOIN + COUNT devolvia 0, nunca None — o casamento tem de fazer o mesmo
+        assert linhas[id_sem]["total_keywords"] == 0
+        assert linhas[id_sem]["total_keywords"] is not None
+
+        # `total_keywords` continua sendo a ÚLTIMA chave da linha (contrato de ordem)
+        assert list(linhas[id_com])[-1] == "total_keywords"
+
+        # ordem preservada: created_at DESC
+        ordem = [row["created_at"] for row in lst.json()]
+        assert ordem == sorted(ordem, reverse=True)
+    finally:
+        await _cleanup_pesquisa_por_nicho(com_kw["nicho"])
+        await _cleanup_pesquisa_por_nicho(sem_kw["nicho"])
