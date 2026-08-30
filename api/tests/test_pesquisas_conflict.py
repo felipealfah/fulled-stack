@@ -143,9 +143,12 @@ async def _cleanup_pesquisa_por_nicho(nicho: str):
     if ids:
         c_lg = await _conn_leadgen()
         try:
-            await c_lg.execute(
-                "DELETE FROM kw_staging WHERE pesquisa_id = ANY($1::uuid[])", ids
-            )
+            # `kw_classification_overrides` também migrou e também perdeu o cascade
+            for tabela in ("kw_staging", "kw_classification_overrides"):
+                await c_lg.execute(
+                    f"DELETE FROM {tabela} WHERE pesquisa_id = ANY($1::uuid[])",  # noqa: S608
+                    ids,
+                )
         finally:
             await c_lg.close()
 
@@ -513,3 +516,237 @@ async def test_list_pesquisas_conta_keywords_do_supabase(
     finally:
         await _cleanup_pesquisa_por_nicho(com_kw["nicho"])
         await _cleanup_pesquisa_por_nicho(sem_kw["nicho"])
+
+
+# ── Os 3 handlers que o plano 35-08 não enumerou e que nenhum teste cobria ────────
+
+
+@pytest.mark.asyncio
+async def test_get_pesquisa_junta_os_dois_bancos(unique_pesquisa_payload_com_projeto):
+    """GET /pesquisas/{id}: pesquisa do Postgres, keywords do Supabase.
+
+    Eram duas consultas na mesma conexão. O 404 continua saindo do Postgres antes de
+    o Supabase ser tocado.
+    """
+    payload = dict(unique_pesquisa_payload_com_projeto)
+    payload["keywords"] = [
+        {"keyword": "kw get 1", "kw_type": "PAGINA_PRINCIPAL"},
+        {"keyword": "kw get 2", "kw_type": "SERVICO"},
+    ]
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.post("/pesquisas/", json=payload)
+            assert r.status_code == 200, r.text
+            pesquisa_id = r.json()["pesquisa"]["id"]
+
+            got = await c.get(f"/pesquisas/{pesquisa_id}")
+            assert got.status_code == 200, got.text
+            body = got.json()
+
+            faltando = await c.get(f"/pesquisas/{uuid.uuid4()}")
+            assert faltando.status_code == 404
+            assert faltando.json()["detail"] == "Pesquisa não encontrada"
+
+        # as 4 chaves de sempre
+        assert set(body) == {"pesquisa", "keywords", "total", "go_count"}
+        assert body["pesquisa"]["nicho"] == payload["nicho"]
+        assert body["total"] == 2
+        assert body["go_count"] == 0  # go_nogo é NULL nas keywords recém-criadas
+        assert sorted(k["keyword"] for k in body["keywords"]) == ["kw get 1", "kw get 2"]
+    finally:
+        await _cleanup_pesquisa_por_nicho(payload["nicho"])
+
+
+@pytest.mark.asyncio
+async def test_update_keyword_e_o_override_ficam_os_dois_no_supabase(
+    unique_pesquisa_payload_com_projeto,
+):
+    """PATCH da keyword: kw_staging E kw_classification_overrides migraram as duas.
+
+    O handler virou single-DB no Supabase, e a transação que liga o override ao UPDATE
+    continua sendo uma transação de verdade — não duas escritas soltas.
+    """
+    payload = dict(unique_pesquisa_payload_com_projeto)
+    payload["keywords"] = [{"keyword": "kw override", "kw_type": "SERVICO"}]
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.post("/pesquisas/", json=payload)
+            assert r.status_code == 200, r.text
+            pesquisa_id = r.json()["pesquisa"]["id"]
+
+            c_lg = await _conn_leadgen()
+            try:
+                kw_id = await c_lg.fetchval(
+                    "SELECT id FROM kw_staging WHERE pesquisa_id = $1::uuid", pesquisa_id
+                )
+            finally:
+                await c_lg.close()
+
+            upd = await c.patch(
+                f"/pesquisas/{pesquisa_id}/keywords/{kw_id}",
+                json={"kw_type": "PAGINA_GEO", "board_note": "reclassificada no gate"},
+            )
+            assert upd.status_code == 200, upd.text
+            assert upd.json() == {"ok": True}
+
+        c_lg = await _conn_leadgen()
+        try:
+            kw = await c_lg.fetchrow(
+                "SELECT kw_type, board_note FROM kw_staging WHERE id = $1", kw_id
+            )
+            ovr = await c_lg.fetchrow(
+                """SELECT classificacao_agente, classificacao_humana
+                     FROM kw_classification_overrides WHERE pesquisa_id = $1::uuid""",
+                pesquisa_id,
+            )
+        finally:
+            await c_lg.close()
+
+        assert kw["kw_type"] == "PAGINA_GEO"
+        assert kw["board_note"] == "reclassificada no gate"
+        # o override é o registro de auditoria — tem de existir, no MESMO banco
+        assert ovr is not None, "override não foi gravado no Supabase"
+        assert ovr["classificacao_agente"] == "SERVICO"
+        assert ovr["classificacao_humana"] == "PAGINA_GEO"
+    finally:
+        await _cleanup_pesquisa_por_nicho(payload["nicho"])
+
+
+@pytest.mark.asyncio
+async def test_approve_gate2_aprova_o_fato_antes_da_projecao(
+    unique_pesquisa_payload_com_projeto, monkeypatch,
+):
+    """Gate 1 do Board: keywords ('fato', Supabase) antes de pesquisas ('projeção', PG).
+
+    Mesma ordenação do `/approve` do Plan 35-07 e pelo mesmo motivo. A injeção de falha
+    no passo 2 prova que o estado intermediário é o CONSERVADOR: o pipeline não avança
+    com a tela dizendo 'aprovado' e as keywords ainda 'pending' — que é exatamente o bug
+    histórico que este endpoint existe para não repetir.
+    """
+    payload = dict(unique_pesquisa_payload_com_projeto)
+    payload["keywords"] = [
+        {"keyword": "kw gate2 a", "kw_type": "PAGINA_PRINCIPAL"},
+        {"keyword": "kw gate2 b", "kw_type": "SERVICO"},
+        {"keyword": "kw gate2 lixo", "kw_type": "DESCARTA"},
+    ]
+    payload["skip_descarta"] = False  # a DESCARTA precisa existir para não ser aprovada
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.post("/pesquisas/", json=payload)
+            assert r.status_code == 200, r.text
+            pesquisa_id = r.json()["pesquisa"]["id"]
+
+            # ── Prova da ORDEM: com o Supabase fora, a pesquisa NÃO pode ser promovida.
+            # É este caso que distingue as duas ordens possíveis. Se a projeção viesse
+            # primeiro, aqui a pesquisa ficaria 'aprovado' com as keywords em 'pending'
+            # — a tela dizendo "aprovado" e o /seo-architect sem nada para consumir,
+            # que é o bug histórico que este endpoint existe para não repetir.
+            async def _lg_indisponivel():
+                raise ConnectionError("supabase fora do ar (injetado pelo teste)")
+
+            monkeypatch.setattr(review_module, "get_lg_pool", _lg_indisponivel)
+            sem_supa = await c.post(f"/pesquisas/{pesquisa_id}/approve-gate2")
+            monkeypatch.undo()
+            assert sem_supa.status_code == 500, sem_supa.text
+            assert "NÃO foi promovida" in sem_supa.json()["detail"]
+
+        conn = await _conn_pg()
+        try:
+            st_pg = await conn.fetchval(
+                "SELECT status FROM pesquisas WHERE id = $1::uuid", pesquisa_id
+            )
+        finally:
+            await conn.close()
+        assert st_pg == "classificado", (
+            "a pesquisa foi promovida sem as keywords terem sido aprovadas — "
+            "a ordem fato→projeção foi invertida"
+        )
+        c_lg = await _conn_leadgen()
+        try:
+            pendentes = await c_lg.fetchval(
+                "SELECT COUNT(*) FROM kw_staging "
+                "WHERE pesquisa_id = $1::uuid AND status = 'pending'",
+                pesquisa_id,
+            )
+        finally:
+            await c_lg.close()
+        assert pendentes == 3
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            # ── caminho degradado: Postgres cai ENTRE o fato e a projeção ──
+            # `Pool.acquire` do asyncpg é read-only em C (nota do Plan 35-07), então o
+            # teste troca `review.get_pool` por um proxy do POOL — não o método. A 1ª
+            # aquisição é a resolução/vínculo; da 2ª em diante é a projeção (e, depois,
+            # o espelho no BQ, que degrada sozinho).
+            aquisicoes = {"n": 0}
+            pool_real = await db_module.get_pool()
+
+            class _PoolQueCaiDepoisDaPrimeira:
+                def __getattr__(self, nome):
+                    return getattr(pool_real, nome)
+
+                def acquire(self, *a, **kw):
+                    aquisicoes["n"] += 1
+                    if aquisicoes["n"] > 1:
+                        raise ConnectionError("postgres fora do ar (injetado pelo teste)")
+                    return pool_real.acquire(*a, **kw)
+
+            _proxy = _PoolQueCaiDepoisDaPrimeira()
+
+            async def _get_pool_proxy():
+                return _proxy
+
+            monkeypatch.setattr(review_module, "get_pool", _get_pool_proxy)
+            deg = await c.post(f"/pesquisas/{pesquisa_id}/approve-gate2")
+            monkeypatch.undo()
+
+            # 200 com aviso, nunca 500 mudo
+            assert deg.status_code == 200, deg.text
+            assert "aviso" in deg.json()
+            assert deg.json()["keywords_aprovadas"] == 2  # a DESCARTA ficou de fora
+
+        # o FATO já está gravado...
+        c_lg = await _conn_leadgen()
+        try:
+            st = await c_lg.fetch(
+                """SELECT keyword, status FROM kw_staging
+                    WHERE pesquisa_id = $1::uuid ORDER BY keyword""",
+                pesquisa_id,
+            )
+        finally:
+            await c_lg.close()
+        assert {r["keyword"]: r["status"] for r in st} == {
+            "kw gate2 a": "approved",
+            "kw gate2 b": "approved",
+            "kw gate2 lixo": "pending",
+        }
+
+        # ...e a PROJEÇÃO não — estado conservador, o pipeline não avança
+        conn = await _conn_pg()
+        try:
+            status = await conn.fetchval(
+                "SELECT status FROM pesquisas WHERE id = $1::uuid", pesquisa_id
+            )
+        finally:
+            await conn.close()
+        assert status == "classificado", "a pesquisa não podia ter avançado"
+
+        # reexecutar converge, e o caminho feliz NÃO tem a chave `aviso`
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            ok = await c.post(f"/pesquisas/{pesquisa_id}/approve-gate2")
+        assert ok.status_code == 200, ok.text
+        assert set(ok.json()) == {
+            "ok", "pesquisa_id", "status", "projeto_id", "keywords_aprovadas"
+        }
+        assert ok.json()["keywords_aprovadas"] == 0  # idempotente: nada novo a aprovar
+
+        conn = await _conn_pg()
+        try:
+            status = await conn.fetchval(
+                "SELECT status FROM pesquisas WHERE id = $1::uuid", pesquisa_id
+            )
+        finally:
+            await conn.close()
+        assert status == "aprovado"
+    finally:
+        await _cleanup_pesquisa_por_nicho(payload["nicho"])

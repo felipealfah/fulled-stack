@@ -392,6 +392,12 @@ async def create_pesquisa(body: PesquisaCreate):
 
 @router.get("/{pesquisa_id}")
 async def get_pesquisa(pesquisa_id: str):
+    """A pesquisa (Postgres) e as suas keywords (Supabase).
+
+    Fase 35 / D-02: eram duas consultas na MESMA conexão. Viram uma em cada banco,
+    na ordem de sempre — o 404 sai do Postgres antes de o Supabase ser tocado.
+    O `ORDER BY score DESC NULLS LAST` continua em SQL, do lado onde a coluna mora.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         pesquisa = await conn.fetchrow(
@@ -400,8 +406,11 @@ async def get_pesquisa(pesquisa_id: str):
         if not pesquisa:
             raise HTTPException(404, "Pesquisa não encontrada")
 
-        keywords = await conn.fetch(
-            "SELECT * FROM kw_staging WHERE pesquisa_id = $1 ORDER BY score DESC NULLS LAST",
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        keywords = await c_lg.fetch(
+            "SELECT * FROM kw_staging WHERE pesquisa_id = $1::uuid "
+            "ORDER BY score DESC NULLS LAST",
             pesquisa_id,
         )
 
@@ -415,33 +424,47 @@ async def get_pesquisa(pesquisa_id: str):
 
 @router.patch("/{pesquisa_id}/keywords/{keyword_id}")
 async def update_keyword(pesquisa_id: str, keyword_id: int, body: KeywordUpdate):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        fields = {k: v for k, v in body.model_dump().items() if v is not None}
-        if not fields:
-            raise HTTPException(400, "Nenhum campo para atualizar")
+    """Edita UMA keyword e registra o override de classificação, se houver.
 
-        # Se kw_type está sendo alterado, lê o valor atual para logar o override
-        if "kw_type" in fields:
-            row = await conn.fetchrow(
-                "SELECT keyword, kw_type FROM kw_staging WHERE id = $1 AND pesquisa_id = $2",
-                keyword_id, pesquisa_id,
-            )
-            if row and row["kw_type"] is not None and row["kw_type"] != fields["kw_type"]:
-                await conn.execute(
-                    """INSERT INTO kw_classification_overrides
-                       (pesquisa_id, keyword, classificacao_agente, classificacao_humana)
-                       VALUES ($1, $2, $3, $4)""",
-                    pesquisa_id, row["keyword"], row["kw_type"], fields["kw_type"],
+    Fase 35 / D-02: `kw_staging` E `kw_classification_overrides` migraram as duas —
+    o handler inteiro passou a ser single-DB no Supabase, e a transação que ligava a
+    leitura, o override e o UPDATE continua sendo uma transação de verdade.
+
+    O `AND pesquisa_id` das duas instruções é o que impede editar keyword de outra
+    pesquisa agora que a FK cross-DB não existe (T-35-05).
+    """
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        raise HTTPException(400, "Nenhum campo para atualizar")
+
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        async with c_lg.transaction():
+            # Se kw_type está sendo alterado, lê o valor atual para logar o override
+            if "kw_type" in fields:
+                row = await c_lg.fetchrow(
+                    "SELECT keyword, kw_type FROM kw_staging "
+                    "WHERE id = $1 AND pesquisa_id = $2::uuid",
+                    keyword_id, pesquisa_id,
                 )
+                if row and row["kw_type"] is not None and row["kw_type"] != fields["kw_type"]:
+                    await c_lg.execute(
+                        """INSERT INTO kw_classification_overrides
+                           (pesquisa_id, keyword, classificacao_agente, classificacao_humana)
+                           VALUES ($1::uuid, $2, $3, $4)""",
+                        pesquisa_id, row["keyword"], row["kw_type"], fields["kw_type"],
+                    )
 
-        set_clause = ", ".join(f"{k} = ${i+3}" for i, k in enumerate(fields))
-        values = list(fields.values())
+            # Só NOMES DE COLUNA entram por f-string, e vêm das chaves do modelo
+            # Pydantic — nunca do corpo cru. Os valores seguem em $3..$n (T-35-06).
+            set_clause = ", ".join(f"{k} = ${i+3}" for i, k in enumerate(fields))
+            values = list(fields.values())
 
-        await conn.execute(
-            f"UPDATE kw_staging SET {set_clause} WHERE id = $1 AND pesquisa_id = $2",
-            keyword_id, pesquisa_id, *values,
-        )
+            await c_lg.execute(
+                f"UPDATE kw_staging SET {set_clause} "  # noqa: S608
+                "WHERE id = $1 AND pesquisa_id = $2::uuid",
+                keyword_id, pesquisa_id, *values,
+            )
     return {"ok": True}
 
 
@@ -495,6 +518,23 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
 
     Para aprovação granular (seleção linha a linha, reclassificação, rejeição),
     usar `POST /projetos/{id}/keywords/approve`.
+
+    ## Fase 35 / D-06 — terceira escrita cross-DB do arquivo
+    ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    O `UPDATE pesquisas` e o `UPDATE kw_staging` estavam na MESMA transação e hoje estão
+    em bancos diferentes. A ordem passa a ser a mesma de
+    `POST /projetos/{id}/keywords/approve` (Plan 35-07), e pelo mesmo motivo: a keyword
+    aprovada é o **fato**, `pesquisas.status` é a **projeção** dele.
+
+    Supabase primeiro, Postgres depois. Se o passo do Postgres falhar, as keywords ficam
+    aprovadas e a pesquisa ainda não — o pipeline **não avança**, que é o lado seguro, e
+    reexecutar o mesmo botão converge (a guarda `status = 'pending'` faz o passo 1 virar
+    no-op). A ordem inversa produziria justamente o bug histórico descrito acima: a tela
+    diz "aprovado" e as keywords continuam `pending` para o `/seo-architect`.
+
+    O vínculo com o projeto continua sendo escrito ANTES de tudo: é pré-condição do
+    gate, não efeito dele, e vive inteiro no Postgres.
     """
     pool = await get_pool()
     keywords_aprovadas = 0
@@ -529,32 +569,11 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
                 pesquisa_id, projeto_id,
             )
 
-        async with conn.transaction():
-            # Atualizar pesquisa — status 'aprovado' é o valor válido no check constraint.
-            # O vínculo com o projeto só é reescrito quando um projeto foi informado:
-            # a versão anterior fazia `SET projeto_id = $2` incondicionalmente e, com
-            # body vazio (o caso do dashboard), ZERAVA o vínculo INT legado da pesquisa.
-            if projeto_id:
-                projeto_id_int = await conn.fetchval(
-                    "SELECT id_int_legado FROM projetos WHERE id = $1::uuid", projeto_id
-                )
-                await conn.execute(
-                    """UPDATE pesquisas
-                       SET status = 'aprovado', reviewed_at = NOW(),
-                           projeto_id_uuid = $2::uuid, projeto_id = $3::int
-                       WHERE id = $1""",
-                    pesquisa_id, projeto_id, projeto_id_int,
-                )
-            else:
-                await conn.execute(
-                    """UPDATE pesquisas
-                       SET status = 'aprovado', reviewed_at = NOW()
-                       WHERE id = $1""",
-                    pesquisa_id,
-                )
-
-            # Gate de verdade: as keywords não-DESCARTA saem de 'pending'.
-            result = await conn.execute(
+    # ── Passo 1 — Supabase: o FATO. As keywords não-DESCARTA saem de 'pending'. ──
+    try:
+        lg = await get_lg_pool()
+        async with lg.acquire() as c_lg:
+            result = await c_lg.execute(
                 """UPDATE kw_staging
                       SET status = 'approved', updated_at = NOW()
                     WHERE pesquisa_id = $1::uuid
@@ -563,57 +582,125 @@ async def approve_gate2(pesquisa_id: str, body: ApproveGate2Request = ApproveGat
                 pesquisa_id,
             )
             keywords_aprovadas = int(result.split()[-1])
+    except Exception as e:
+        # O gate NÃO acontece: a pesquisa continua com o status de antes e nenhuma
+        # keyword foi aprovada. É o lado seguro — a tela não pode dizer "aprovado"
+        # enquanto o `/seo-architect` ainda vê tudo em 'pending' (o bug histórico
+        # descrito na docstring). Sem a exceção crua na mensagem (T-35-08).
+        print(
+            f"[review] WARN: aprovação das keywords da pesquisa {pesquisa_id} falhou no "
+            f"Supabase; o gate não foi aplicado: {type(e).__name__}",
+            file=sys.stderr,
+        )
+        raise HTTPException(
+            500,
+            "As keywords não puderam ser aprovadas e a pesquisa NÃO foi promovida. "
+            "Nenhuma etapa do gate foi aplicada — reexecute a aprovação.",
+        )
+
+    # ── Passo 2 — Postgres: a PROJEÇÃO. ──
+    aviso = None
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Atualizar pesquisa — status 'aprovado' é o valor válido no check constraint.
+                # O vínculo com o projeto só é reescrito quando um projeto foi informado:
+                # a versão anterior fazia `SET projeto_id = $2` incondicionalmente e, com
+                # body vazio (o caso do dashboard), ZERAVA o vínculo INT legado da pesquisa.
+                if projeto_id:
+                    projeto_id_int = await conn.fetchval(
+                        "SELECT id_int_legado FROM projetos WHERE id = $1::uuid", projeto_id
+                    )
+                    await conn.execute(
+                        """UPDATE pesquisas
+                           SET status = 'aprovado', reviewed_at = NOW(),
+                               projeto_id_uuid = $2::uuid, projeto_id = $3::int
+                           WHERE id = $1""",
+                        pesquisa_id, projeto_id, projeto_id_int,
+                    )
+                else:
+                    await conn.execute(
+                        """UPDATE pesquisas
+                           SET status = 'aprovado', reviewed_at = NOW()
+                           WHERE id = $1""",
+                        pesquisa_id,
+                    )
+    except Exception as e:
+        # Nunca falhar mudo: as keywords JÁ estão aprovadas no Supabase. Mesmo recorte do
+        # `aviso` do /approve (Plan 35-07) — 200 com campo extra, jamais um 500 mudo.
+        # Sem a exceção crua nem a connection string na mensagem (T-35-08).
+        print(
+            f"[review] WARN: keywords da pesquisa {pesquisa_id} aprovadas no Supabase mas "
+            f"a promoção da pesquisa no Postgres falhou: {type(e).__name__}",
+            file=sys.stderr,
+        )
+        aviso = (
+            "As keywords foram aprovadas, mas a sincronização do status da pesquisa ficou "
+            "pendente. Reexecute a aprovação para concluir — a operação é idempotente e "
+            "não duplica efeito."
+        )
 
     # Gravar keywords aprovadas em BQ leadgen_silver.kw_plan (espelho — Postgres é fonte de verdade)
+    #
+    # Fase 35 / D-02: o bloco INTEIRO é best-effort, e não só o INSERT no BQ. A leitura
+    # das linhas agora atravessa DOIS bancos (`_kw_gate2`) e roda DEPOIS de o gate já ter
+    # sido efetivado — deixá-la fora do try faria uma falha do espelho descartar um gate
+    # bem-sucedido e devolver 500, perdendo inclusive o `aviso` do passo 2. O espelho
+    # nunca pode derrubar a operação que ele espelha.
     bq = _get_bq_client()
     if bq:
-        # Fase 35 / D-02: o JOIN cross-fronteira virou duas consultas casadas em memória.
-        kw_rows = await _kw_gate2(pesquisa_id)
+        try:
+            # O JOIN cross-fronteira virou duas consultas casadas em memória.
+            kw_rows = await _kw_gate2(pesquisa_id)
 
-        promovido_em = datetime.now(timezone.utc).isoformat()
-        rows_bq = []
-        for row in kw_rows:
-            d = dict(row)
-            rows_bq.append({
-                "pesquisa_id":          d["pesquisa_id"],
-                "nicho":                d["nicho"],
-                "cidade":               d["cidade"],
-                "geo_target_id":        d.get("geo_target_id"),
-                "pesquisado_em":        d["pesquisado_em"].isoformat() if d.get("pesquisado_em") else None,
-                "keyword":              d["keyword"],
-                "avg_monthly_searches": d.get("avg_monthly_searches"),
-                "competition":          d.get("competition"),
-                "competition_index":    d.get("competition_index"),
-                "cpc_low_brl":          float(d["cpc_low_brl"]) if d.get("cpc_low_brl") else None,
-                "cpc_high_brl":         float(d["cpc_high_brl"]) if d.get("cpc_high_brl") else None,
-                "opportunity_score":    float(d["opportunity_score"]) if d.get("opportunity_score") else None,
-                "recomendacao":         d.get("recomendacao"),
-                "tipo":                 d.get("tipo"),
-                "board_go_nogo":        d.get("board_go_nogo"),
-                "board_note":           d.get("board_note"),
-                "projeto_nome":         d.get("projeto_nome"),
-                "projeto_url":          d.get("projeto_url"),
-                "monthly_volumes":      None,
-                "promovido_em":         promovido_em,
-            })
+            promovido_em = datetime.now(timezone.utc).isoformat()
+            rows_bq = []
+            for row in kw_rows:
+                d = dict(row)
+                rows_bq.append({
+                    "pesquisa_id":          d["pesquisa_id"],
+                    "nicho":                d["nicho"],
+                    "cidade":               d["cidade"],
+                    "geo_target_id":        d.get("geo_target_id"),
+                    "pesquisado_em":        d["pesquisado_em"].isoformat() if d.get("pesquisado_em") else None,
+                    "keyword":              d["keyword"],
+                    "avg_monthly_searches": d.get("avg_monthly_searches"),
+                    "competition":          d.get("competition"),
+                    "competition_index":    d.get("competition_index"),
+                    "cpc_low_brl":          float(d["cpc_low_brl"]) if d.get("cpc_low_brl") else None,
+                    "cpc_high_brl":         float(d["cpc_high_brl"]) if d.get("cpc_high_brl") else None,
+                    "opportunity_score":    float(d["opportunity_score"]) if d.get("opportunity_score") else None,
+                    "recomendacao":         d.get("recomendacao"),
+                    "tipo":                 d.get("tipo"),
+                    "board_go_nogo":        d.get("board_go_nogo"),
+                    "board_note":           d.get("board_note"),
+                    "projeto_nome":         d.get("projeto_nome"),
+                    "projeto_url":          d.get("projeto_url"),
+                    "monthly_volumes":      None,
+                    "promovido_em":         promovido_em,
+                })
 
-        if rows_bq:
-            try:
+            if rows_bq:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
                     lambda: _insert_kw_plan_silver(bq, rows_bq),
                 )
-            except Exception as e:
-                print(f"[WARN] Erro gravando BQ silver.kw_plan: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Erro gravando BQ silver.kw_plan: {e}", file=sys.stderr)
 
-    return {
+    resposta = {
         "ok": True,
         "pesquisa_id": pesquisa_id,
         "status": "aprovado",
         "projeto_id": projeto_id,
         "keywords_aprovadas": keywords_aprovadas,
     }
+    # `aviso` só existe no caminho degradado — no caminho feliz a resposta tem
+    # exatamente as 5 chaves de sempre, nem uma a mais (SC-01).
+    if aviso:
+        resposta["aviso"] = aviso
+    return resposta
 
 
 @router.patch("/{pesquisa_id}/vincular")
