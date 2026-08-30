@@ -9,6 +9,8 @@ load_dotenv()
 
 import auth as auth_lib
 from db import get_pool, close_pool
+# Fase 35 / D-02: segundo pool — dados pré-decisão do LeadGen no Supabase.
+from db_leadgen import get_lg_pool, close_lg_pool
 from routers import review, projects, projetos
 from routers.auth import router as auth_router
 from routers.agent_executions import router as agent_executions_router
@@ -30,8 +32,10 @@ from routers.kw_mgmt import router as kw_mgmt_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await get_pool()
+    await get_lg_pool()
     yield
     await close_pool()
+    await close_lg_pool()
 
 
 app = FastAPI(title="FullED API", version="1.0.0", lifespan=lifespan)

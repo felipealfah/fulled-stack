@@ -15,8 +15,15 @@ Casos mínimos (não re-testa todos os 7 endpoints — só o padrão):
   T3: POST upsert com UUID → 200 + row com AMBOS projeto_id INT e projeto_id_uuid
   T4: PATCH section com UUID → 200
 
+## Fase 35 / D-02 — content_pages passou a morar no Supabase
+As asserções de banco deste arquivo consultam `leadgen.content_pages` no Supabase
+(`LEADGEN_DB_URL`), não mais o Postgres da Stack: o handler resolve o projeto no
+Postgres (`_resolve_projeto_id_int`) e faz todo o resto no Supabase. O contrato
+HTTP verificado pelos testes é byte-idêntico ao de antes (SC-01).
+
 Pré-condições:
-- Túnel VPS Postgres em localhost:5434.
+- Túnel VPS Postgres aberto em localhost:5433 (`bash vps_tunnel.sh -d`).
+- LEADGEN_DB_URL configurada (vem do .env via conftest.py).
 - AUTH_ENABLED=false.
 
 Rodar:
@@ -66,8 +73,13 @@ async def _reset_pool_por_teste():
 
 @pytest.fixture
 async def db_conn():
-    dsn = os.environ["DATABASE_URL"]
-    conn = await asyncpg.connect(dsn)
+    """Conexão direta ao Supabase — onde `content_pages` vive desde a Fase 35.
+
+    `search_path=leadgen` espelha o pool da app (`db_leadgen.get_lg_pool`), então
+    as queries do teste continuam dizendo `FROM content_pages` sem prefixo.
+    """
+    dsn = os.environ["LEADGEN_DB_URL"]
+    conn = await asyncpg.connect(dsn, server_settings={"search_path": "leadgen"})
     yield conn
     await conn.close()
 

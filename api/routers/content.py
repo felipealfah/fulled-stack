@@ -18,15 +18,32 @@ populamos `projeto_id_uuid` para que o dashboard scoped por projeto enxergue
 as rows. Antes desta correção, todos os 7 endpoints estavam órfãos da
 migração UUID (Phase 05) e retornavam 500/422 em prod.
 
+## Fase 35 / D-02 — content_pages mora no Supabase (schema `leadgen`)
+ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+Todo handler passa a ser de dois passos, sem uma linha de SQL alterada:
+
+  1. `c_pg` (pool do Postgres da Stack) resolve o projeto via `_resolve_projeto_id_int`.
+     Sem FK cross-DB, esse passo deixa de ser conveniência e vira o **único** controle de
+     acesso entre projetos (mitigação T-35-05) — o `projeto_id` do path nunca vai direto
+     ao Supabase.
+  2. `c_lg` (pool do Supabase, `db_leadgen.get_lg_pool`) executa TODO o SQL de
+     `content_pages`. O `search_path=leadgen` do pool resolve o schema, então as queries
+     continuam dizendo `FROM content_pages` sem prefixo.
+
+Este fluxo NÃO cruza a fronteira em escrita: o passo 1 é leitura no Postgres e o passo 2
+é escrita single-DB no Supabase. Não há compensação a fazer (D-06 superestima este fluxo).
+
 Segurança (T-21-03): Parâmetros posicionais $1, $2 em todos os handlers — nunca f-string com valores de usuário.
 Idempotência (T-21-04): /approve valida status='revisado' antes de UPDATE.
-JSONB (T-21-05): Codec _init_conn em db.py deserializa review_report JSONB como dict Python automaticamente.
+JSONB (T-21-05): Codec _init_conn em db.py e db_leadgen.py deserializa review_report JSONB como dict Python automaticamente.
 """
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from db import get_pool
+from db_leadgen import get_lg_pool
 from routers._common import _resolve_projeto
 
 router = APIRouter(prefix="/projetos", tags=["content"])
@@ -72,9 +89,11 @@ async def _resolve_projeto_id_int(conn, projeto_id: str) -> int:
 
 @router.get("/{projeto_id}/content")
 async def list_content_pages(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, projeto_id, projeto_id_uuid, page_slug, page_type, status,
                       review_report, reviewed_at, approved_at, created_at, updated_at
@@ -92,9 +111,11 @@ async def list_content_pages(projeto_id: str):
 
 @router.post("/{projeto_id}/content")
 async def upsert_content_page(projeto_id: str, body: ContentPageUpsert):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO content_pages
                  (projeto_id, projeto_id_uuid, page_slug, page_type, status, review_report, reviewed_at, updated_at)
@@ -122,9 +143,11 @@ async def upsert_content_page(projeto_id: str, body: ContentPageUpsert):
 
 @router.patch("/{projeto_id}/content/{page_slug}/approve")
 async def approve_content_page(projeto_id: str, page_slug: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, status, review_report FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             id_int,
@@ -167,9 +190,11 @@ async def approve_content_page(projeto_id: str, page_slug: str):
 async def update_content_page_status(projeto_id: str, page_slug: str, body: ContentPageStatusUpdate):
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, f"Status inválido. Use: {', '.join(sorted(VALID_STATUSES))}")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             id_int,
@@ -195,9 +220,11 @@ async def update_content_page_status(projeto_id: str, page_slug: str, body: Cont
 
 @router.delete("/{projeto_id}/content/{page_slug}", status_code=204)
 async def delete_content_page(projeto_id: str, page_slug: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         result = await conn.execute(
             "DELETE FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             id_int,
@@ -215,9 +242,11 @@ async def delete_content_page(projeto_id: str, page_slug: str):
 async def close_review(projeto_id: str, page_slug: str):
     """Sinaliza revisão concluída (todas as seções ok). Atualiza status para 'revisado'.
     Board faz aprovação final via /approve."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             id_int,
@@ -242,9 +271,11 @@ async def close_review(projeto_id: str, page_slug: str):
 
 @router.delete("/{projeto_id}/content/{page_slug}/section/{section_name}")
 async def delete_content_page_section(projeto_id: str, page_slug: str, section_name: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             id_int,
@@ -276,9 +307,11 @@ VALID_SECTION_STATUSES = {'ok', 'ajustar', 'flag', 'refazer'}
 async def update_content_page_section(projeto_id: str, page_slug: str, body: ContentPageSectionUpdate):
     if body.status not in VALID_SECTION_STATUSES:
         raise HTTPException(400, f"Status de seção inválido. Use: {', '.join(sorted(VALID_SECTION_STATUSES))}")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        id_int = await _resolve_projeto_id_int(conn, projeto_id)
+    pg = await get_pool()
+    lg = await get_lg_pool()
+    async with pg.acquire() as c_pg:
+        id_int = await _resolve_projeto_id_int(c_pg, projeto_id)
+    async with lg.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, review_report FROM content_pages WHERE projeto_id = $1 AND page_slug = $2",
             id_int,
