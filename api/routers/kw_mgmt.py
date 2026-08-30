@@ -14,6 +14,8 @@ Consequência estrutural: não existe mais FK atravessando a fronteira. O que o 
 garantia — titularidade da keyword e limpeza em cascata — passa a ser responsabilidade
 explícita destes handlers.
 """
+import sys
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -140,21 +142,62 @@ async def bulk_reclassify(pesquisa_id: str, body: BulkReclassifyRequest):
     return {"updated": updated, "not_found": not_found, "invalid": invalid}
 
 
+# Fase 35 / D-06 — o que o `DELETE FROM pesquisas` disparava sozinho no banco.
+# Conferidas no catálogo do Postgres vivo (`pg_constraint` com `confrelid = 'pesquisas'`),
+# NÃO na documentação nem na migration de origem — foi assim que o Plan 35-04 descobriu
+# que a lista dele estava incompleta.
+#
+# `confdeltype = 'c'` (CASCADE) e `'a'` (NO ACTION) → a linha filha deixa de existir:
+_TABELAS_APAGAR = (
+    "kw_classification_overrides",   # 'a' — já era apagada à mão; só muda de conexão
+    "scorecard_overrides",           # 'a' — idem
+    "kw_scorecard",                  # 'a' — idem
+    "kw_staging",                    # 'c' — a novidade: dependia do CASCADE do banco
+)
+# `confdeltype = 'n'` (SET NULL) → a linha filha SOBREVIVE, só perde o vínculo. Apagar
+# aqui destruiria conteúdo publicado; o comportamento a preservar é o nullify.
+_TABELAS_NULIFICAR = (
+    "content_pages",
+    "projeto_seo_plan_pages",
+)
+
+
 @router.delete("/{pesquisa_id}")
 async def delete_pesquisa(pesquisa_id: str, force: bool = False):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    """Apaga a pesquisa e tudo que dependia dela.
+
+    ## Fase 35 / D-06 — o cascade do banco não existe mais
+    ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    Antes, um único `DELETE FROM pesquisas` disparava as FKs de 6 tabelas. Todas as 6
+    moram agora no Supabase e não há FK atravessando a fronteira dos bancos: sem limpeza
+    explícita o delete passaria a deixar lixo invisível (`kw_staging`) e vínculos
+    apontando para uma pesquisa que não existe mais (`content_pages`). As três etapas
+    abaixo são ordenadas de propósito.
+
+    Filhos primeiro, pesquisa por último: a intenção do endpoint é destrutiva, então uma
+    falha no passo 3 deixa a pesquisa viva **sem** keywords, e reexecutar o `DELETE`
+    converge (o passo 2 vira no-op). A ordem inversa deixaria órfãos permanentes e
+    invisíveis.
+
+    A guarda 409 de projeto em produção é avaliada no passo 1 — antes de qualquer escrita,
+    em qualquer um dos dois bancos.
+    """
+    # Passo 1 — Postgres da Stack: guarda e resolução. Nenhuma escrita aqui.
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
         try:
-            row = await conn.fetchrow(
-                """SELECT p.id, p.projeto_id_uuid, proj.status AS projeto_status,
-                          (SELECT COUNT(*) FROM kw_staging WHERE pesquisa_id = p.id) AS kw_count
+            row = await c_pg.fetchrow(
+                """SELECT p.id, p.projeto_id_uuid, proj.status AS projeto_status
                    FROM pesquisas p
                    LEFT JOIN projetos proj ON proj.id = p.projeto_id_uuid
                    WHERE p.id = $1::uuid""",
                 pesquisa_id,
             )
-        except Exception:
-            raise HTTPException(422, "pesquisa_id não é um UUID válido")
+        except Exception as e:
+            if _e_uuid_malformado(e):
+                raise HTTPException(422, "pesquisa_id não é um UUID válido")
+            raise
 
         if not row:
             raise HTTPException(404, "Pesquisa não encontrada")
@@ -165,17 +208,55 @@ async def delete_pesquisa(pesquisa_id: str, force: bool = False):
                 "Pesquisa pertence a projeto em produção (status=" + row["projeto_status"] + ") — passe ?force=true para forçar",
             )
 
-        deleted_keywords = row["kw_count"]
-
-        async with conn.transaction():
-            await conn.execute("DELETE FROM kw_classification_overrides WHERE pesquisa_id = $1::uuid", pesquisa_id)
-            await conn.execute("DELETE FROM scorecard_overrides WHERE pesquisa_id = $1::uuid", pesquisa_id)
-            await conn.execute("DELETE FROM kw_scorecard WHERE pesquisa_id = $1::uuid", pesquisa_id)
-            await conn.execute("DELETE FROM agent_executions WHERE pesquisa_id = $1::uuid", pesquisa_id)
-            await conn.execute(
-                "UPDATE projetos SET pesquisa_id_atual = NULL WHERE pesquisa_id_atual = $1::uuid",
+    # Passo 2 — Fase 35 / D-06: limpar os filhos no Supabase, numa transação só.
+    # O `RETURNING id` do `kw_staging` é a contagem real de keywords removidas — é o valor
+    # que o subselect `kw_count` devolvia antes de a tabela mudar de banco.
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        async with c_lg.transaction():
+            for tabela in _TABELAS_APAGAR:
+                if tabela == "kw_staging":
+                    continue  # tratada abaixo — precisa do RETURNING para a contagem
+                # noqa S608: o identificador vem de _TABELAS_APAGAR (constante do módulo),
+                # nunca de entrada do usuário; o único valor continua parametrizado em $1
+                # (T-35-06). É o caso de identificador dinâmico que o CLAUDE.md abre como
+                # exceção — nome de tabela por f-string, valor nunca.
+                await c_lg.execute(
+                    f"DELETE FROM {tabela} WHERE pesquisa_id = $1::uuid", pesquisa_id,  # noqa: S608
+                )
+            apagadas = await c_lg.fetch(
+                "DELETE FROM kw_staging WHERE pesquisa_id = $1::uuid RETURNING id",
                 pesquisa_id,
             )
-            await conn.execute("DELETE FROM pesquisas WHERE id = $1::uuid", pesquisa_id)
+            deleted_keywords = len(apagadas)
+            for tabela in _TABELAS_NULIFICAR:
+                await c_lg.execute(
+                    f"UPDATE {tabela} SET pesquisa_id = NULL WHERE pesquisa_id = $1::uuid",  # noqa: S608
+                    pesquisa_id,
+                )
+
+    # Passo 3 — só então o Postgres. `agent_executions` e `projetos` não migraram.
+    try:
+        async with pg.acquire() as c_pg:
+            async with c_pg.transaction():
+                await c_pg.execute("DELETE FROM agent_executions WHERE pesquisa_id = $1::uuid", pesquisa_id)
+                await c_pg.execute(
+                    "UPDATE projetos SET pesquisa_id_atual = NULL WHERE pesquisa_id_atual = $1::uuid",
+                    pesquisa_id,
+                )
+                await c_pg.execute("DELETE FROM pesquisas WHERE id = $1::uuid", pesquisa_id)
+    except Exception as e:
+        # Nunca falhar mudo: os filhos já foram apagados e a pesquisa continua de pé.
+        print(
+            f"[kw_mgmt] WARN: filhos da pesquisa {pesquisa_id} apagados no Supabase mas o "
+            f"DELETE no Postgres falhou: {type(e).__name__}",
+            file=sys.stderr,
+        )
+        raise HTTPException(
+            500,
+            "As keywords e os dados dependentes da pesquisa foram apagados, mas a pesquisa "
+            "em si não pôde ser removida. Reexecute o DELETE para concluir — a operação é "
+            "idempotente.",
+        )
 
     return {"deleted_keywords": deleted_keywords, "soft": False}
