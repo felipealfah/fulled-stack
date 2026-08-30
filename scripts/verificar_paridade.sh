@@ -8,8 +8,13 @@
 # Sai 0 apenas se, para TODAS as 15 tabelas:
 #   (a) count(*) da origem == count(*) do destino;
 #   (b) o checksum MD5 das linhas (ordenado, independente de ordem física) bate;
-#   (c) toda sequence do schema `leadgen` está no ponto certo — last_value == MAX(id)
-#       da sua tabela (ou sequence nunca chamada, quando a tabela está vazia).
+#   (c) nenhuma sequence do schema `leadgen` está ATRASADA — last_value >= MAX(id) da
+#       sua tabela (ou sequence nunca chamada, quando a tabela está vazia).
+#       O perigo é a sequence ficar ATRÁS do MAX(id): aí a próxima escrita colide de PK.
+#       Sequence à FRENTE do MAX(id) é segura — só abre buraco na numeração, e é o estado
+#       normal depois de qualquer DELETE ou de qualquer rollback de teste (nextval não é
+#       transacional). O próprio Postgres da Stack está assim na origem: `kw_staging`
+#       tem sequence em 952 com MAX(id)=669. Exigir igualdade reprovaria os dois bancos.
 # Qualquer divergência sai 1 com um resumo em pt-BR.
 #
 # Ambiente exigido (mesmas variáveis do api/tests/conftest.py):
@@ -126,6 +131,7 @@ seq_out=$(consultar "$LEADGEN_DB_URL" "
          || '|' || CASE
                      WHEN mx.v IS NULL OR mx.v = 0                        THEN 'OK-vazia'
                      WHEN pg_sequence_last_value(s.oid) = mx.v            THEN 'OK'
+                     WHEN pg_sequence_last_value(s.oid) > mx.v            THEN 'OK-adiantada'
                      ELSE 'DIVERGENTE'
                    END
     FROM pg_class s
@@ -147,10 +153,12 @@ if [ -z "$seq_out" ]; then
 else
   while IFS='|' read -r nome last mx veredito; do
     [ -z "$nome" ] && continue
-    if [ "${veredito#OK}" != "$veredito" ]; then
+    if [ "$veredito" = "OK-adiantada" ]; then
+      echo "  ✓ ${nome}: last_value=${last} > max(id)=${mx} — adiantada (buraco na numeração, sem colisão)"
+    elif [ "${veredito#OK}" != "$veredito" ]; then
       echo "  ✓ ${nome}: last_value=${last} max(id)=${mx}"
     else
-      echo "  ✗ ${nome}: last_value=${last} mas max(id)=${mx} — a próxima escrita colide de PK"
+      echo "  ✗ ${nome}: last_value=${last} ATRÁS de max(id)=${mx} — a próxima escrita colide de PK"
       divergencias=$((divergencias + 1))
     fi
   done <<< "$seq_out"
