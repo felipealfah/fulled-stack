@@ -11,6 +11,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 from pydantic import BaseModel
 from db import get_pool
+from db_leadgen import get_lg_pool
 from routers._common import _load_gcp_key
 
 router = APIRouter(prefix="/pesquisas", tags=["review"])
@@ -101,17 +102,36 @@ class PesquisaCreate(BaseModel):
 
 @router.post("/")
 async def create_pesquisa(body: PesquisaCreate):
-    """Cria pesquisa + kw_staging em uma única transação.
+    """Cria a pesquisa no Postgres e as keywords no Supabase, nessa ordem.
 
     Usado pelo agente `/kw-validator` para persistir o resultado do
     kw_research + classificação. A pesquisa nasce com status='classificado'
     (kw-validator já classificou — Gate 2 no dashboard /kw-planner) e as
     keywords com status='pending'.
+
+    ## Fase 35 / D-06 — a ordem aqui é o INVERSO da do `/approve`
+    ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    Isto era **uma** transação: `pesquisas` (Postgres) e `kw_staging` (Supabase) hoje
+    moram em bancos diferentes e não há transação atravessando a fronteira.
+
+    Em `POST /projetos/{id}/keywords/approve` a ordem é Supabase→Postgres, porque lá o
+    fato (a keyword aprovada) precede a projeção (o status da pesquisa). **Aqui é o
+    contrário:** `kw_staging.pesquisa_id` *referencia* a pesquisa, então a pesquisa
+    precisa existir primeiro. Copiar a ordem do `/approve` para cá gravaria keywords
+    apontando para uma pesquisa que ainda não existe — órfãs invisíveis, já que a FK
+    cross-DB também não existe mais para recusá-las.
+
+    A falha da etapa 2 deixa a pesquisa **sem keywords**: estado visível (a resposta diz
+    exatamente isso, em pt-BR) e curável reexecutando a mesma chamada, que cai no
+    `UniqueViolationError` já tratado abaixo. É o mesmo caminho de cura que o retry do
+    `/kw-validator` sempre teve.
     """
     pool = await get_pool()
     pesquisa_row = None
     inserted = 0
 
+    # ── Etapa 1 — Postgres: a pesquisa. Nada é escrito no Supabase antes disto. ──
     async with pool.acquire() as conn:
         # Wrapper try captura UniqueViolation após o rollback automático da
         # transaction (asyncpg lança InFailedSQLTransactionError se tentarmos
@@ -148,46 +168,14 @@ async def create_pesquisa(body: PesquisaCreate):
                     json.dumps(body.avaliacao_json) if body.avaliacao_json is not None else None,
                     json.dumps(body.seed_keywords) if body.seed_keywords is not None else None,
                 )
-                pesquisa_id = pesquisa_row["id"]
-
-                kw_rows = [
-                    k for k in body.keywords
-                    if not (body.skip_descarta and k.kw_type == "DESCARTA")
-                ]
-                if kw_rows:
-                    values = []
-                    params: list = []
-                    for i, k in enumerate(kw_rows):
-                        base = i * 9
-                        values.append(
-                            f"(${base+1}::uuid, ${base+2}, ${base+3}, ${base+4}, "
-                            f"${base+5}, ${base+6}, ${base+7}, ${base+8}, ${base+9}, 'pending')"
-                        )
-                        params.extend([
-                            pesquisa_id,
-                            k.keyword,
-                            k.kw_type,
-                            k.avg_monthly_searches,
-                            k.bid_pos5_8_brl,
-                            k.bid_pos1_4_brl,
-                            k.competition_index,
-                            str(k.competition) if k.competition is not None else None,
-                            k.board_note,
-                        ])
-                    sql = (
-                        "INSERT INTO kw_staging (pesquisa_id, keyword, kw_type, "
-                        "avg_monthly_searches, bid_pos5_8_brl, bid_pos1_4_brl, "
-                        "competition_index, competition, board_note, status) VALUES "
-                        + ", ".join(values)
-                    )
-                    await conn.execute(sql, *params)
-                    inserted = len(kw_rows)
         except asyncpg.UniqueViolationError:
             # REQ-8-08 / CRIT-5: retry após timeout retorna 409 com pesquisa_id
             # existente para skill tratar como sucesso. A UNIQUE natural
             # pesquisas_natural_key cobre (nicho, cidade, projeto_id_uuid, papel).
             # A transaction já sofreu rollback automático via context manager
-            # do asyncpg — kw_staging não fica com row órfã (T5 do teste).
+            # do asyncpg. Fase 35: com o INSERT de kw_staging movido para DEPOIS
+            # deste bloco, o retry nem chega a tocar o Supabase — não há row órfã
+            # a reverter (T5 do teste ficou estritamente mais forte).
             # IS NOT DISTINCT FROM trata NULL corretamente.
             existing = await conn.fetchrow(
                 """SELECT id FROM pesquisas
@@ -204,6 +192,60 @@ async def create_pesquisa(body: PesquisaCreate):
                     "pesquisa_id": str(existing["id"]) if existing else None,
                 },
             )
+
+    # ── Etapa 2 — Supabase: as keywords, já com o pesquisa_id que passou a existir. ──
+    pesquisa_id = pesquisa_row["id"]
+    kw_rows = [
+        k for k in body.keywords
+        if not (body.skip_descarta and k.kw_type == "DESCARTA")
+    ]
+    if kw_rows:
+        values = []
+        params: list = []
+        for i, k in enumerate(kw_rows):
+            base = i * 9
+            values.append(
+                f"(${base+1}::uuid, ${base+2}, ${base+3}, ${base+4}, "
+                f"${base+5}, ${base+6}, ${base+7}, ${base+8}, ${base+9}, 'pending')"
+            )
+            params.extend([
+                pesquisa_id,
+                k.keyword,
+                k.kw_type,
+                k.avg_monthly_searches,
+                k.bid_pos5_8_brl,
+                k.bid_pos1_4_brl,
+                k.competition_index,
+                str(k.competition) if k.competition is not None else None,
+                k.board_note,
+            ])
+        # Só os índices posicionais entram por f-string; todo valor do corpo viaja
+        # em `params` (T-35-06). É o mesmo formato multi-VALUES de antes do corte.
+        sql = (
+            "INSERT INTO kw_staging (pesquisa_id, keyword, kw_type, "
+            "avg_monthly_searches, bid_pos5_8_brl, bid_pos1_4_brl, "
+            "competition_index, competition, board_note, status) VALUES "
+            + ", ".join(values)
+        )
+        try:
+            lg = await get_lg_pool()
+            async with lg.acquire() as c_lg:
+                await c_lg.execute(sql, *params)
+        except Exception as e:
+            # Nunca falhar mudo: a pesquisa JÁ existe no Postgres, sem keywords.
+            # Sem a exceção crua nem a connection string na mensagem (T-35-08).
+            print(
+                f"[review] WARN: pesquisa {pesquisa_id} criada no Postgres mas as "
+                f"{len(kw_rows)} keywords não foram gravadas no Supabase: {type(e).__name__}",
+                file=sys.stderr,
+            )
+            raise HTTPException(
+                500,
+                "A pesquisa foi criada, mas as keywords não foram gravadas. Reexecute a "
+                "mesma chamada para concluir — a pesquisa já existente é devolvida em um "
+                "409 com o seu pesquisa_id.",
+            )
+        inserted = len(kw_rows)
 
     return {
         "pesquisa": dict(pesquisa_row),

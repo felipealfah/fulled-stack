@@ -1,7 +1,11 @@
 """Testes REQ-8-08: POST /pesquisas/ retorna 409 com pesquisa_id existente após retry.
 
+Fase 35 / D-06 — este arquivo passou a atravessar DOIS bancos:
+  `pesquisas`/`projetos`/`agent_executions` → Postgres da Stack (`DATABASE_URL`)
+  `kw_staging`                              → Supabase, schema leadgen (`LEADGEN_DB_URL`)
+
 Pré-condições:
-- Túnel VPS Postgres aberto em localhost:5434 (docker compose exec do túnel).
+- Túnel VPS Postgres aberto em localhost:5433 (`bash Full_AIOS_STACK/vps_tunnel.sh -d`).
 - Migration 027 aplicada (UNIQUE natural pesquisas_natural_key).
 - AUTH_ENABLED=false (setado no conftest.py).
 
@@ -25,6 +29,36 @@ if str(_API_DIR) not in sys.path:
 
 from main import app  # noqa: E402
 import db as db_module  # noqa: E402
+import routers.review as review_module  # noqa: E402
+
+
+async def _conn_pg():
+    """Conexão avulsa com o Postgres da Stack (camada de decisão)."""
+    import asyncpg
+    return await asyncpg.connect(os.environ["DATABASE_URL"])
+
+
+async def _conn_leadgen():
+    """Conexão avulsa com o Supabase, schema `leadgen` (camada pré-decisão).
+
+    `search_path` replica o `server_settings` de `db_leadgen.get_lg_pool` — sem ele
+    `FROM kw_staging` não resolve e o teste falha com UndefinedTableError.
+    """
+    import asyncpg
+    return await asyncpg.connect(
+        os.environ["LEADGEN_DB_URL"], server_settings={"search_path": "leadgen"}
+    )
+
+
+async def _kw_count(pesquisa_id: str) -> int:
+    """Conta as keywords daquela pesquisa no Supabase."""
+    c = await _conn_leadgen()
+    try:
+        return await c.fetchval(
+            "SELECT COUNT(*) FROM kw_staging WHERE pesquisa_id = $1::uuid", pesquisa_id
+        )
+    finally:
+        await c.close()
 
 
 # UUID real do projeto MM Entulho no VPS (id_int_legado=8).
@@ -90,12 +124,33 @@ def unique_pesquisa_payload_com_projeto():
 
 
 async def _cleanup_pesquisa_por_nicho(nicho: str):
-    """Remove pesquisa criada pelos testes para manter idempotência entre runs."""
-    import asyncpg
-    dsn = os.environ["DATABASE_URL"]
-    conn = await asyncpg.connect(dsn)
+    """Remove pesquisa criada pelos testes para manter idempotência entre runs.
+
+    Fase 35 / D-06: `kw_staging` NÃO cascateia mais — a FK que a apagava junto com a
+    pesquisa não existe desde que a tabela mudou de banco. Sem o DELETE explícito no
+    Supabase, cada rodada da suíte deixaria keywords órfãs para trás (SC-04).
+    Filhos primeiro, pesquisa por último — a mesma ordem do `DELETE /pesquisas/{id}`.
+    """
+    conn = await _conn_pg()
     try:
-        # kw_staging cascateia via ON DELETE CASCADE
+        ids = [
+            r["id"]
+            for r in await conn.fetch("SELECT id FROM pesquisas WHERE nicho = $1", nicho)
+        ]
+    finally:
+        await conn.close()
+
+    if ids:
+        c_lg = await _conn_leadgen()
+        try:
+            await c_lg.execute(
+                "DELETE FROM kw_staging WHERE pesquisa_id = ANY($1::uuid[])", ids
+            )
+        finally:
+            await c_lg.close()
+
+    conn = await _conn_pg()
+    try:
         await conn.execute(
             "DELETE FROM agent_executions WHERE pesquisa_id IN (SELECT id FROM pesquisas WHERE nicho = $1)",
             nicho,
@@ -189,22 +244,131 @@ async def test_post_pesquisa_rollback_no_orphan_kw(
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             r1 = await c.post("/pesquisas/", json=payload)
             assert r1.status_code == 200
+            pesquisa_id = r1.json()["pesquisa"]["id"]
             r2 = await c.post("/pesquisas/", json=payload)
             assert r2.status_code == 409
 
-        # Verifica que só existe 1 kw_staging para essa pesquisa (não 2).
-        import asyncpg
-        dsn = os.environ["DATABASE_URL"]
-        conn = await asyncpg.connect(dsn)
+        # Fase 35: o JOIN cross-fronteira virou duas leituras. A pesquisa é resolvida
+        # no Postgres e a contagem é feita no Supabase — o mesmo que o JOIN media.
+        conn = await _conn_pg()
         try:
-            count = await conn.fetchval(
-                """SELECT COUNT(*) FROM kw_staging k
-                     JOIN pesquisas p ON p.id = k.pesquisa_id
-                    WHERE p.nicho = $1 AND p.projeto_id_uuid = $2::uuid""",
+            ids = await conn.fetch(
+                """SELECT id FROM pesquisas
+                    WHERE nicho = $1 AND projeto_id_uuid = $2::uuid""",
                 payload["nicho"], PROJETO_UUID_MM_ENTULHO,
             )
-            assert count == 1, f"kw_staging duplicado: {count} rows (esperado 1)"
         finally:
             await conn.close()
+        assert len(ids) == 1, f"pesquisa duplicada: {len(ids)} rows (esperado 1)"
+
+        count = await _kw_count(pesquisa_id)
+        assert count == 1, f"kw_staging duplicado: {count} rows (esperado 1)"
+    finally:
+        await _cleanup_pesquisa_por_nicho(payload["nicho"])
+
+
+@pytest.mark.asyncio
+async def test_keywords_gravadas_batem_com_as_enviadas(
+    unique_pesquisa_payload_com_projeto,
+):
+    """Paridade: cada keyword não-DESCARTA enviada vira uma linha no Supabase.
+
+    É o teste que pega a etapa 2 virar no-op silencioso — a resposta continuaria
+    dizendo `keywords_inseridas: N` enquanto o Supabase ficaria vazio, e o pipeline
+    a jusante encontraria uma pesquisa sem keyword nenhuma.
+    """
+    payload = dict(unique_pesquisa_payload_com_projeto)
+    payload["keywords"] = [
+        {"keyword": "kw paridade 1", "kw_type": "PAGINA_PRINCIPAL", "avg_monthly_searches": 320},
+        {"keyword": "kw paridade 2", "kw_type": "SERVICO"},
+        {"keyword": "kw paridade 3", "kw_type": "PAGINA_GEO"},
+        {"keyword": "kw paridade descartada", "kw_type": "DESCARTA"},
+    ]
+    esperado = 3  # a DESCARTA é ignorada por skip_descarta=True (default)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.post("/pesquisas/", json=payload)
+            assert r.status_code == 200, r.text
+            body = r.json()
+            pesquisa_id = body["pesquisa"]["id"]
+
+        assert body["keywords_inseridas"] == esperado
+        assert body["keywords_ignoradas_descarta"] == 1
+
+        gravadas = await _kw_count(pesquisa_id)
+        assert gravadas == esperado, (
+            f"a resposta diz {esperado} keywords, o Supabase tem {gravadas}"
+        )
+
+        # E os valores atravessaram como valores, não como texto de SQL (T-35-06).
+        c_lg = await _conn_leadgen()
+        try:
+            rows = await c_lg.fetch(
+                """SELECT keyword, kw_type, avg_monthly_searches, status
+                     FROM kw_staging WHERE pesquisa_id = $1::uuid ORDER BY keyword""",
+                pesquisa_id,
+            )
+        finally:
+            await c_lg.close()
+        assert [r["keyword"] for r in rows] == [
+            "kw paridade 1", "kw paridade 2", "kw paridade 3"
+        ]
+        assert rows[0]["avg_monthly_searches"] == 320
+        assert {r["status"] for r in rows} == {"pending"}
+    finally:
+        await _cleanup_pesquisa_por_nicho(payload["nicho"])
+
+
+@pytest.mark.asyncio
+async def test_falha_do_supabase_deixa_pesquisa_sem_keywords_e_o_retry_cura(
+    unique_pesquisa_payload_com_projeto, monkeypatch,
+):
+    """A ordem Postgres→Supabase, provada por injeção de falha ENTRE as duas escritas.
+
+    Fase 35 / D-06. Se a ordem fosse a do `/approve` (Supabase primeiro), uma falha
+    do Postgres deixaria keywords apontando para uma pesquisa inexistente — órfãs que
+    nenhuma FK recusa mais. Na ordem certa a janela produz o estado oposto: a pesquisa
+    existe **sem** keywords, o cliente é avisado em pt-BR, e reexecutar converge.
+    """
+    payload = unique_pesquisa_payload_com_projeto
+
+    async def _pool_indisponivel():
+        raise ConnectionError("supabase fora do ar (injetado pelo teste)")
+
+    try:
+        monkeypatch.setattr(review_module, "get_lg_pool", _pool_indisponivel)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            r = await c.post("/pesquisas/", json=payload)
+
+        # Nunca um 500 mudo: a mensagem em pt-BR explica o efeito parcial.
+        assert r.status_code == 500, r.text
+        detalhe = r.json()["detail"]
+        assert "pesquisa foi criada" in detalhe
+        assert "Reexecute" in detalhe
+
+        # Etapa 1 durável: a pesquisa está no Postgres...
+        conn = await _conn_pg()
+        try:
+            row = await conn.fetchrow(
+                "SELECT id, status FROM pesquisas WHERE nicho = $1", payload["nicho"]
+            )
+        finally:
+            await conn.close()
+        assert row is not None, "a pesquisa deveria ter sido gravada ANTES do Supabase"
+        assert row["status"] == "classificado"
+
+        # ...e nenhuma keyword órfã ficou do outro lado.
+        assert await _kw_count(str(row["id"])) == 0
+
+        # A cura: reexecutar cai no 409 já tratado, com o pesquisa_id existente.
+        monkeypatch.undo()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            r2 = await c.post("/pesquisas/", json=payload)
+        assert r2.status_code == 409, r2.text
+        assert r2.json()["detail"]["pesquisa_id"] == str(row["id"])
     finally:
         await _cleanup_pesquisa_por_nicho(payload["nicho"])
