@@ -74,6 +74,10 @@ services:
       GCP_SC_KEY: ${GCP_SC_KEY:-}
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      # Fase 35 / D-02 — segundo pool: dados pre-decisao do LeadGen no Supabase.
+      # Exclusiva deste servico. Nunca em build.args do `frontend` nem com prefixo
+      # VITE_: o Vite injeta VITE_* no bundle publico e isto e credencial (T-35-04).
+      LEADGEN_DB_URL: ${LEADGEN_DB_URL:-}
     volumes:
       # Full_AIOS_Data esta fora do repo STACK — usar path absoluto
       - /Users/felipefull/Documents/Full_AIOS/Full_AIOS_Data:/data

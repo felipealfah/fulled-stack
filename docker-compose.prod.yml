@@ -86,6 +86,10 @@ services:
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
       SUPABASE_ADMIN_USER_ID: ${SUPABASE_ADMIN_USER_ID:-}
+      # Fase 35 / D-02 — segundo pool: dados pre-decisao do LeadGen no Supabase.
+      # Exclusiva deste servico. Nunca em build.args do `frontend` nem com prefixo
+      # VITE_: o Vite injeta VITE_* no bundle publico e isto e credencial (T-35-04).
+      LEADGEN_DB_URL: ${LEADGEN_DB_URL:-}
       DATA_DIR: /data/leadgen
     volumes:
       # Na VPS não existe o path do Mac — volume nomeado (cache SerpAPI, parquets)
