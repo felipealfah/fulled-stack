@@ -464,12 +464,17 @@ async def update_seo_plan_page_intel(projeto_id: str, page_id: int, body: SeoPla
 
 @router.post("/{projeto_id}/seo-plan/populate-intel")
 async def populate_intel(projeto_id: str):
-    # Fase 35 / D-02: `kw_staging` e `projeto_seo_plan_pages` migraram juntas, então o laço
-    # inteiro é single-DB — não há composição cross-DB a fazer aqui. O que muda é a
-    # DISTÂNCIA: o que era round-trip local virou round-trip pela internet. Daí a exigência
-    # de UMA conexão do pool do Supabase (`acquire()` fora do laço, Pitfall 8) com a
-    # transação existente envolvendo o laço inteiro. O custo está medido em
-    # `test_populate_intel_lote_grande_dentro_do_limite` (≥ 30 páginas, limite de 5 s).
+    # Fase 35 / D-02: `kw_staging` e `projeto_seo_plan_pages` migraram juntas, então não há
+    # composição cross-DB aqui. O que mudou foi a DISTÂNCIA: o laço fazia até dois
+    # round-trips por página, e o que era local passou a atravessar a internet.
+    #
+    # MEDIDO antes de reescrever (Open Question 4 da RESEARCH.md): com o laço item a item
+    # numa única conexão, 30 páginas levavam **13,83 s** — 2,8× o limite de 5 s de
+    # `test_populate_intel_lote_grande_dentro_do_limite` (~115 ms por round-trip). Só então
+    # o laço virou 3 consultas de custo CONSTANTE: uma leitura de intel por
+    # `kw_principal_id`, uma por `pesquisa_id`, e um UPDATE em lote com `unnest`
+    # (mesmo recorte de intel.py e kw_mgmt.py). O casamento página→intel acontece em
+    # memória, sem `await` dentro do laço.
     pg = await get_pool()
     async with pg.acquire() as c_pg:
         proj = await _resolve_projeto(c_pg, projeto_id)
@@ -491,47 +496,91 @@ async def populate_intel(projeto_id: str):
         if not pages:
             return {"pages_updated": 0, "pages_sem_intel": []}
 
-        pages_updated = 0
         pages_sem_intel: list[int] = []
 
-        async with c_lg.transaction():
-            for page in pages:
-                if page["kw_principal_id"] is not None:
-                    intel = await c_lg.fetchrow(
-                        "SELECT competitive_score, difficulty_label, top_competitor_url FROM kw_staging WHERE id = $1",
-                        page["kw_principal_id"],
-                    )
-                else:
-                    intel = await c_lg.fetchrow(
-                        """SELECT competitive_score, difficulty_label, top_competitor_url
-                           FROM kw_staging
-                           WHERE pesquisa_id = $1 AND competitive_score IS NOT NULL
-                           ORDER BY competitive_score DESC NULLS LAST
-                           LIMIT 1""",
-                        page["pesquisa_id"],
-                    )
+        # Passo 1 — intel por `kw_principal_id`, em UMA consulta. Substitui, sem mudar a
+        # condição, o `WHERE id = $1` que rodava por página.
+        kw_ids = list({p["kw_principal_id"] for p in pages if p["kw_principal_id"] is not None})
+        intel_por_kw = {}
+        if kw_ids:
+            intel_por_kw = {
+                r["id"]: r
+                for r in await c_lg.fetch(
+                    """SELECT id, competitive_score, difficulty_label, top_competitor_url
+                       FROM kw_staging WHERE id = ANY($1::int[])""",
+                    kw_ids,
+                )
+            }
 
-                if intel is None or intel["competitive_score"] is None:
-                    pages_sem_intel.append(page["page_id"])
-                    continue
+        # Passo 2 — fallback por `pesquisa_id`, também em UMA consulta. O `DISTINCT ON`
+        # com o MESMO `ORDER BY competitive_score DESC NULLS LAST` reproduz o
+        # `LIMIT 1` por pesquisa: uma linha de score máximo entre as que têm score. Em
+        # empate a escolha é arbitrária dos dois lados — o `LIMIT 1` original também era.
+        pesquisas_fallback = list(
+            {p["pesquisa_id"] for p in pages if p["kw_principal_id"] is None and p["pesquisa_id"]}
+        )
+        intel_por_pesquisa = {}
+        if pesquisas_fallback:
+            intel_por_pesquisa = {
+                r["pesquisa_id"]: r
+                for r in await c_lg.fetch(
+                    """SELECT DISTINCT ON (pesquisa_id)
+                              pesquisa_id, competitive_score, difficulty_label, top_competitor_url
+                       FROM kw_staging
+                       WHERE pesquisa_id = ANY($1::uuid[]) AND competitive_score IS NOT NULL
+                       ORDER BY pesquisa_id, competitive_score DESC NULLS LAST""",
+                    pesquisas_fallback,
+                )
+            }
 
-                mapped_difficulty = CANONICAL_TO_PT_DIFFICULTY.get(
+        # Passo 3 — casamento em memória. Nenhum `await` neste laço: ele só decide o que
+        # entra no lote e o que vira `pages_sem_intel`, na ordem original das páginas.
+        ids_update: list[int] = []
+        scores_update: list[int] = []
+        labels_update: list[str | None] = []
+        urls_update: list[str | None] = []
+
+        for page in pages:
+            if page["kw_principal_id"] is not None:
+                intel = intel_por_kw.get(page["kw_principal_id"])
+            else:
+                intel = intel_por_pesquisa.get(page["pesquisa_id"])
+
+            if intel is None or intel["competitive_score"] is None:
+                pages_sem_intel.append(page["page_id"])
+                continue
+
+            ids_update.append(page["page_id"])
+            scores_update.append(int(intel["competitive_score"]))
+            labels_update.append(
+                CANONICAL_TO_PT_DIFFICULTY.get(
                     intel["difficulty_label"], intel["difficulty_label"]
                 )
+            )
+            urls_update.append(intel["top_competitor_url"])
 
-                await c_lg.execute(
+        # Passo 4 — uma instrução para o lote inteiro. `unnest` de arrays paralelos, todos
+        # parametrizados (T-35-06). O `RETURNING` devolve as páginas que realmente casaram,
+        # que é a mesma contagem do laço antigo — os ids vieram desta própria tabela.
+        pages_updated = 0
+        if ids_update:
+            async with c_lg.transaction():
+                atualizadas = await c_lg.fetch(
                     """UPDATE projeto_seo_plan_pages
-                       SET competitive_score = $2,
-                           difficulty_label = $3,
-                           top_competitor_url = $4,
-                           intel_updated_at = NOW()
-                       WHERE id = $1""",
-                    page["page_id"],
-                    int(intel["competitive_score"]) if intel["competitive_score"] is not None else None,
-                    mapped_difficulty,
-                    intel["top_competitor_url"],
+                          SET competitive_score  = t.competitive_score,
+                              difficulty_label   = t.difficulty_label,
+                              top_competitor_url = t.top_competitor_url,
+                              intel_updated_at   = NOW()
+                         FROM unnest($1::int[], $2::int[], $3::text[], $4::text[])
+                              AS t(page_id, competitive_score, difficulty_label, top_competitor_url)
+                        WHERE projeto_seo_plan_pages.id = t.page_id
+                    RETURNING projeto_seo_plan_pages.id""",
+                    ids_update,
+                    scores_update,
+                    labels_update,
+                    urls_update,
                 )
-                pages_updated += 1
+            pages_updated = len(atualizadas)
 
     return {"pages_updated": pages_updated, "pages_sem_intel": pages_sem_intel}
 
