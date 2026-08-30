@@ -8,9 +8,16 @@ Testes cobrem:
 - Projeto não encontrado → 404
 
 Pré-condições:
-- Postgres local em localhost:5432 (docker compose).
+- Túnel do Postgres da Stack aberto (`bash Full_AIOS_STACK/vps_tunnel.sh -d`, localhost:5433).
 - Migration 030 bloco B aplicado (CHECK difficulty tolerante).
-- AUTH_ENABLED=false.
+- As duas DSNs resolvidas pelo `conftest.py` (DATABASE_URL e LEADGEN_DB_URL); AUTH_ENABLED=false.
+
+⚠️ Este módulo NÃO define `os.environ["DATABASE_URL"]`. Até a Fase 35 ele fazia isso em
+nível de módulo, com a senha de produção versionada e uma DSN morta (`localhost:5432`,
+stack local desligado). Como o pytest importa TODOS os módulos de teste na coleção, essa
+única linha envenenava a sessão inteira — `pytest api/tests -q` dava
+`53 failed, 7 passed, 59 errors` com a linha e `111 passed, 3 failed` sem ela.
+Não reintroduzir: as DSNs vêm do `conftest.py`, como em todos os outros arquivos.
 
 Rodar:
     cd Full_AIOS_STACK
@@ -19,12 +26,9 @@ Rodar:
 
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
-
-# Override DATABASE_URL para postgres local (5432) antes de qualquer import da app.
-os.environ["DATABASE_URL"] = "postgres://fulled:9n7dx5GRZ4Pd20XEkN5zvj4AVqtWS8G8@localhost:5432/fulled"
-os.environ["AUTH_ENABLED"] = "false"
 
 import asyncpg
 import pytest
@@ -81,11 +85,18 @@ async def _seed_projeto(conn) -> tuple[str, int]:
 
 
 async def _seed_pesquisa(conn, projeto_id_uuid: str) -> str:
-    """Cria pesquisa vinculada ao projeto. Retorna pesquisa_id (uuid str)."""
+    """Cria pesquisa vinculada ao projeto. Retorna pesquisa_id (uuid str).
+
+    Status `aprovado`: o `pesquisas_status_check` do Postgres de produção aceita
+    apenas {pending_review, approved, rejected, classificado, aprovado}. O valor
+    anterior (`gate_2_approved`) só existia no banco de dev que a DSN morta do
+    topo deste arquivo apontava. `populate_intel` não filtra por status da
+    pesquisa, então a escolha não afeta o comportamento sob teste.
+    """
     suffix = uuid.uuid4().hex[:8]
     pid = await conn.fetchval(
         """INSERT INTO pesquisas (projeto_nome, nicho, cidade, status, projeto_id_uuid)
-           VALUES ($1, $2, 'Brasília', 'gate_2_approved', $3::uuid) RETURNING id""",
+           VALUES ($1, $2, 'Brasília', 'aprovado', $3::uuid) RETURNING id""",
         f"Test-PopIntel-Pesq-{suffix}",
         f"nicho-pesq-pi-{suffix}",
         projeto_id_uuid,
