@@ -372,3 +372,100 @@ async def test_falha_do_supabase_deixa_pesquisa_sem_keywords_e_o_retry_cura(
         assert r2.json()["detail"]["pesquisa_id"] == str(row["id"])
     finally:
         await _cleanup_pesquisa_por_nicho(payload["nicho"])
+
+
+@pytest.mark.asyncio
+async def test_reject_limpa_supabase_e_marca_postgres(
+    unique_pesquisa_payload_com_projeto,
+):
+    """POST /reject zera kw_staging no Supabase E marca 'rejected' no Postgres.
+
+    Fase 35 / D-06: as duas pontas da escrita cross-DB, conferidas nos bancos e não
+    só na resposta HTTP.
+    """
+    payload = unique_pesquisa_payload_com_projeto
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.post("/pesquisas/", json=payload)
+            assert r.status_code == 200, r.text
+            pesquisa_id = r.json()["pesquisa"]["id"]
+            assert await _kw_count(pesquisa_id) == 1
+
+            rej = await c.post(f"/pesquisas/{pesquisa_id}/reject")
+            assert rej.status_code == 200, rej.text
+            # A chave `message` é contrato — o texto não muda com a migração.
+            assert rej.json() == {
+                "ok": True,
+                "message": f"Pesquisa {pesquisa_id} rejeitada e removida do staging",
+            }
+
+        assert await _kw_count(pesquisa_id) == 0
+
+        conn = await _conn_pg()
+        try:
+            status = await conn.fetchval(
+                "SELECT status FROM pesquisas WHERE id = $1::uuid", pesquisa_id
+            )
+        finally:
+            await conn.close()
+        assert status == "rejected"
+    finally:
+        await _cleanup_pesquisa_por_nicho(payload["nicho"])
+
+
+@pytest.mark.asyncio
+async def test_reject_de_pesquisa_inexistente_404_sem_tocar_o_supabase():
+    """O 404 sai do passo 1, antes de qualquer escrita nos dois bancos."""
+    inexistente = str(uuid.uuid4())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post(f"/pesquisas/{inexistente}/reject")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Pesquisa não encontrada"
+
+
+@pytest.mark.asyncio
+async def test_delete_keyword_de_outra_pesquisa_404_e_nao_apaga(
+    unique_pesquisa_payload_com_projeto,
+):
+    """T-35-05: sem FK cross-DB, o `AND pesquisa_id` é o que impede a travessia.
+
+    Passa um `keyword_id` real, mas de OUTRA pesquisa. Tem de dar 404 e a keyword
+    alheia tem de continuar viva.
+    """
+    payload_a = unique_pesquisa_payload_com_projeto
+    suffix = uuid.uuid4().hex[:8]
+    payload_b = {
+        **payload_a,
+        "nicho": f"nicho-conflict-b-{suffix}",
+        "keywords": [{"keyword": "kw da pesquisa B", "kw_type": "SERVICO"}],
+    }
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            ra = await c.post("/pesquisas/", json=payload_a)
+            rb = await c.post("/pesquisas/", json=payload_b)
+            assert ra.status_code == 200 and rb.status_code == 200, (ra.text, rb.text)
+            id_a = ra.json()["pesquisa"]["id"]
+            id_b = rb.json()["pesquisa"]["id"]
+
+            c_lg = await _conn_leadgen()
+            try:
+                kw_b = await c_lg.fetchval(
+                    "SELECT id FROM kw_staging WHERE pesquisa_id = $1::uuid", id_b
+                )
+            finally:
+                await c_lg.close()
+
+            # keyword de B, endereçada pela pesquisa A
+            r = await c.delete(f"/pesquisas/{id_a}/keywords/{kw_b}")
+            assert r.status_code == 404, r.text
+            assert r.json()["detail"] == "Keyword não encontrada"
+
+            assert await _kw_count(id_b) == 1, "a keyword de B não podia ter sido apagada"
+
+            # e o caminho legítimo continua funcionando
+            ok = await c.delete(f"/pesquisas/{id_b}/keywords/{kw_b}")
+            assert ok.status_code == 200, ok.text
+            assert await _kw_count(id_b) == 0
+    finally:
+        await _cleanup_pesquisa_por_nicho(payload_a["nicho"])
+        await _cleanup_pesquisa_por_nicho(payload_b["nicho"])

@@ -569,10 +569,19 @@ async def desvincular_pesquisa(pesquisa_id: str):
 
 @router.delete("/{pesquisa_id}/keywords/{keyword_id}")
 async def delete_keyword(pesquisa_id: str, keyword_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM kw_staging WHERE id = $1 AND pesquisa_id = $2",
+    """Apaga UMA keyword da pesquisa.
+
+    Fase 35 / D-02: `kw_staging` mora no Supabase — só a conexão mudou.
+
+    O `AND pesquisa_id = $2` não é redundante: com a FK cross-DB removida, é ele que
+    impede apagar a keyword de outra pesquisa passando um `keyword_id` alheio (T-35-05).
+    Os DOIS predicados precisam continuar no WHERE — o 404 em pt-BR sai justamente de
+    nenhuma linha ter sido afetada.
+    """
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        result = await c_lg.execute(
+            "DELETE FROM kw_staging WHERE id = $1 AND pesquisa_id = $2::uuid",
             keyword_id, pesquisa_id,
         )
     if result == "DELETE 0":
@@ -584,7 +593,28 @@ async def delete_keyword(pesquisa_id: str, keyword_id: int):
 
 @router.post("/{pesquisa_id}/reject")
 async def reject_pesquisa(pesquisa_id: str):
+    """Rejeita a pesquisa e remove as keywords do staging.
+
+    ## Fase 35 / D-06 — escrita cross-DB não prevista no ADR
+    ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    Era um `DELETE FROM kw_staging` + `UPDATE pesquisas` na mesma conexão. As duas
+    tabelas estão em bancos diferentes agora, então viram três etapas ordenadas:
+
+    1. Postgres: resolve a pesquisa e devolve o 404 — validação **antes** de qualquer
+       escrita, nos dois bancos.
+    2. Supabase: apaga as keywords.
+    3. Postgres: marca a pesquisa como rejeitada.
+
+    Filhos primeiro, pela mesma razão dos outros deletes da fase (`DELETE /pesquisas/{id}`
+    em kw_mgmt.py): a intenção do endpoint é destrutiva, então a falha do passo 3 deixa a
+    pesquisa sem keywords e ainda não rejeitada — reexecutar converge, com o passo 2
+    virando no-op. A ordem inversa deixaria keywords órfãs e permanentes, apontando para
+    uma pesquisa rejeitada que ninguém mais visita.
+    """
     pool = await get_pool()
+
+    # Passo 1 — Postgres: resolução e 404. Nenhuma escrita aqui.
     async with pool.acquire() as conn:
         pesquisa = await conn.fetchrow(
             "SELECT * FROM pesquisas WHERE id = $1", pesquisa_id
@@ -592,11 +622,32 @@ async def reject_pesquisa(pesquisa_id: str):
         if not pesquisa:
             raise HTTPException(404, "Pesquisa não encontrada")
 
-        # Remove keywords e marca pesquisa como rejeitada
-        await conn.execute("DELETE FROM kw_staging WHERE pesquisa_id = $1", pesquisa_id)
-        await conn.execute(
-            "UPDATE pesquisas SET status = 'rejected', reviewed_at = NOW() WHERE id = $1",
-            pesquisa_id,
+    # Passo 2 — Supabase: as keywords saem do staging.
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        await c_lg.execute(
+            "DELETE FROM kw_staging WHERE pesquisa_id = $1::uuid", pesquisa_id
+        )
+
+    # Passo 3 — Postgres: só então a pesquisa vira 'rejected'.
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE pesquisas SET status = 'rejected', reviewed_at = NOW() WHERE id = $1",
+                pesquisa_id,
+            )
+    except Exception as e:
+        # Nunca falhar mudo: as keywords JÁ foram apagadas. Sem a exceção crua nem a
+        # connection string na mensagem (T-35-08).
+        print(
+            f"[review] WARN: keywords da pesquisa {pesquisa_id} apagadas no Supabase mas "
+            f"o UPDATE de status no Postgres falhou: {type(e).__name__}",
+            file=sys.stderr,
+        )
+        raise HTTPException(
+            500,
+            "As keywords foram removidas do staging, mas a pesquisa não pôde ser marcada "
+            "como rejeitada. Reexecute a rejeição para concluir — a operação é idempotente.",
         )
 
     return {"ok": True, "message": f"Pesquisa {pesquisa_id} rejeitada e removida do staging"}
