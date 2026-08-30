@@ -19,13 +19,18 @@ Migration 032 reparou os dados existentes.
 ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
 
 Este é o arquivo que mais atravessa a fronteira dos dois bancos, e o único da fase que
-**escreve** nos dois. O `_where_projeto()` — fragmento SQL que casava a pesquisa pelo
-UUID ou pelo INT legado dentro de um JOIN `kw_staging × pesquisas` — dá lugar a
-`_common._pesquisas_do_projeto()`, que roda no Postgres e devolve a lista de
-`pesquisa_id`. Do lado do Supabase toda query filtra por
+**escreve** nos dois. O antigo `_where_projeto()` — fragmento SQL que casava a pesquisa
+pelo UUID ou pelo INT legado dentro de um JOIN `kw_staging × pesquisas` — não existe
+mais: a mesma semântica vive em `_common._pesquisas_do_projeto()`, que roda no Postgres
+e devolve a lista de `pesquisa_id`. Do lado do Supabase toda query filtra por
 `pesquisa_id = ANY($1::uuid[])` com parâmetro posicional — nunca por concatenação de ids
 (T-35-06) e nunca por valor vindo do corpo da requisição (T-35-05).
+
+A estratégia de consistência do Gate (fato→projeção, sem outbox e sem compensação) está
+no docstring de `approve_keywords_plan`.
 """
+
+import sys
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -39,21 +44,6 @@ router = APIRouter(prefix="/projetos", tags=["keywords"])
 
 # Status de pesquisa que o Board considera revisável/aprovável.
 PESQUISA_STATUS_REVISAVEL = ("classificado", "aprovado")
-
-
-def _where_projeto(uuid_param: int, int_param: int) -> str:
-    """Fragmento WHERE que casa a pesquisa pelo UUID OU pelo INT legado.
-
-    Recebe os NÚMEROS dos placeholders asyncpg (ex.: 1 e 2 → "$1"/"$2").
-    O INT pode ser NULL — `$2::int IS NOT NULL AND` protege o comparativo.
-
-    Fase 35: só resta em uso no Gate de aprovação, migrado logo em seguida — some do
-    arquivo quando o último JOIN cross-fronteira sair.
-    """
-    return (
-        f"(p.projeto_id_uuid = ${uuid_param}::uuid"
-        f" OR (${int_param}::int IS NOT NULL AND p.projeto_id = ${int_param}::int))"
-    )
 
 
 def _listagem_vazia() -> dict:
@@ -257,7 +247,7 @@ async def approve_keywords_plan(projeto_id: str, body: ApprovePlanRequest):
     Substitui o `approve-classified` disparado às cegas pelo `/seo-architect`:
     aqui quem decide é o Board, no dashboard, com seleção explícita.
 
-    Ordem dentro da transação (importa):
+    Ordem (importa):
       1. reclassify — muda kw_type das keywords indicadas
       2. reject     — marca status='rejected'
       3. approve    — marca status='approved' (pula kw_type=DESCARTA)
@@ -268,31 +258,74 @@ async def approve_keywords_plan(projeto_id: str, body: ApprovePlanRequest):
     são aplicados, o que permite usar o endpoint só para editar.
 
     IDs que não pertencem ao projeto voltam em `not_found` e não quebram o lote.
+
+    ## Fase 35 / D-06 — fato primeiro, projeção depois
+    ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    Os passos 1-3 escrevem em `kw_staging` (Supabase); o passo 4 escreve em `pesquisas`
+    (Postgres). A transação única que cobria os quatro não existe mais, e não há 2PC
+    entre os dois bancos. O que dispensa outbox e saga aqui é uma propriedade do próprio
+    passo 4: `pesquisas.status` é uma **projeção pura** do estado de `kw_staging` — o SQL
+    original já dizia `SET 'aprovado' ... WHERE status='classificado' AND EXISTS (kw
+    aprovada)`. Não é dado independente; é recomputável a partir do fato.
+
+    Daí a ordenação:
+      Bloco 0 — Postgres, leitura. Resolve projeto e pesquisas. Nenhuma escrita.
+      Bloco A — Supabase, o FATO. Os passos 1-3 inteiros dentro de UMA transação: ou os
+                três acontecem, ou nenhum. Essa é a atomicidade que realmente importa.
+      Bloco B — Postgres, a PROJEÇÃO, fora da transação do Supabase.
+
+    Falha do bloco A: nada mudou nos dois bancos (rollback). Reclicar resolve.
+    Falha do bloco B **depois** de A commitado: `kw_staging` aprovada e `pesquisas` ainda
+    em 'classificado' — falha na direção conservadora (o pipeline não avança; jamais
+    avança com dado errado). A resposta é **200 com `pesquisas_atualizadas: []` e um
+    campo `aviso`**, nunca um 500 mudo: o Board precisa saber que o clique teve efeito
+    parcial. A cura é reexecutar o mesmo endpoint — o bloco A vira no-op pelas guardas
+    `status <> 'approved'` / `status <> 'rejected'` / `status = 'pending'`, e o bloco B
+    roda de novo sobre o `WHERE status='classificado'`, que também é idempotente.
+
+    **Nunca compensar.** Desfazer o approve no Supabase quando B falha é mais arriscado
+    do que deixar o estado conservador e reexecutar.
     """
+    # ── Bloco 0 — Postgres: resolve o projeto e suas pesquisas. Nenhuma escrita. ──
+    # Duas listas, e a diferença entre elas não é detalhe: a aprovação só alcança as
+    # pesquisas revisáveis, mas `skipped_descarta` e `pending_restantes` sempre contaram
+    # sobre TODAS as pesquisas do projeto (o SQL original não filtrava status nessas
+    # duas). Usar a lista errada muda contagem que o Board lê na tela.
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            proj = await _resolve_projeto(conn, projeto_id)
-            pid_int = proj["id_int_legado"]
-            where_proj = _where_projeto(1, 2)
-            proj_params = [projeto_id, pid_int]
+        proj = await _resolve_projeto(conn, projeto_id)
+        pmap = await _pesquisas_do_projeto(conn, projeto_id, proj["id_int_legado"])
 
-            # ── Universo de keywords do projeto (id → kw_type atual) ──
-            owned_rows = await conn.fetch(
-                f"""SELECT ks.id, UPPER(COALESCE(ks.kw_type, '')) AS kw_type
-                      FROM kw_staging ks
-                      JOIN pesquisas p ON p.id = ks.pesquisa_id
-                     WHERE {where_proj}
-                       AND p.status = ANY($3::text[])""",
-                *proj_params, list(PESQUISA_STATUS_REVISAVEL),
+    ids_projeto = list(pmap.keys())
+    ids_revisaveis = [
+        pid for pid, row in pmap.items() if row["status"] in PESQUISA_STATUS_REVISAVEL
+    ]
+
+    not_found: list[int] = []
+    invalid: list[dict] = []
+
+    # ── Bloco A — Supabase: o FATO, os 3 passos numa transação só ──
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        async with c_lg.transaction():
+            # Universo de keywords do projeto (id → kw_type atual). Sem FK cross-DB,
+            # esta lista — derivada do projeto resolvido no Postgres — é o que impede um
+            # `keyword_id` forjado no corpo atingir keyword de outro projeto (T-35-05).
+            owned_rows = await c_lg.fetch(
+                """SELECT ks.id, UPPER(COALESCE(ks.kw_type, '')) AS kw_type
+                     FROM kw_staging ks
+                    WHERE ks.pesquisa_id = ANY($1::uuid[])""",
+                ids_revisaveis,
             )
             owned: dict[int, str] = {r["id"]: r["kw_type"] for r in owned_rows}
 
-            not_found: list[int] = []
-            invalid: list[dict] = []
-
             # ── 1. Reclassificar ──
+            # Em lote: o laço item a item emitia um `execute` por keyword, e o contrato
+            # aceita `max_length=5000`. Com o banco em localhost era barato; depois do
+            # corte cada volta atravessa a internet (Pitfall 8).
             reclassified = 0
+            lote_reclassify: dict[int, str] = {}
             for item in body.reclassify:
                 if item.kw_type not in ALLOWED_KW_TYPES:
                     invalid.append({
@@ -304,22 +337,34 @@ async def approve_keywords_plan(projeto_id: str, body: ApprovePlanRequest):
                 if item.keyword_id not in owned:
                     not_found.append(item.keyword_id)
                     continue
-                await conn.execute(
-                    "UPDATE kw_staging SET kw_type = $1, updated_at = NOW() WHERE id = $2",
-                    item.kw_type, item.keyword_id,
-                )
+                # Deduplicação mantendo a ÚLTIMA ocorrência — é o estado que o laço
+                # deixava no banco. `reclassified` continua contando por item, inclusive
+                # os repetidos, como antes.
+                lote_reclassify[item.keyword_id] = item.kw_type
                 owned[item.keyword_id] = item.kw_type.upper()
                 reclassified += 1
+            if lote_reclassify:
+                await c_lg.execute(
+                    """UPDATE kw_staging
+                          SET kw_type = t.tipo, updated_at = NOW()
+                         FROM unnest($1::int[], $2::text[]) AS t(id, tipo)
+                        WHERE kw_staging.id = t.id
+                          AND kw_staging.pesquisa_id = ANY($3::uuid[])""",
+                    list(lote_reclassify.keys()),
+                    list(lote_reclassify.values()),
+                    ids_revisaveis,
+                )
 
             # ── 2. Rejeitar ──
             reject_ok = [i for i in body.reject_ids if i in owned]
             not_found.extend(i for i in body.reject_ids if i not in owned)
             rejected = 0
             if reject_ok:
-                result = await conn.execute(
+                result = await c_lg.execute(
                     """UPDATE kw_staging SET status = 'rejected', updated_at = NOW()
-                        WHERE id = ANY($1::int[]) AND status <> 'rejected'""",
-                    reject_ok,
+                        WHERE id = ANY($1::int[]) AND status <> 'rejected'
+                          AND pesquisa_id = ANY($2::uuid[])""",
+                    reject_ok, ids_revisaveis,
                 )
                 rejected = int(result.split()[-1])
 
@@ -327,26 +372,20 @@ async def approve_keywords_plan(projeto_id: str, body: ApprovePlanRequest):
             skipped_descarta = 0
             approved = 0
             if body.approve_all_non_descarta:
-                result = await conn.execute(
-                    f"""UPDATE kw_staging AS k
-                           SET status = 'approved', updated_at = NOW()
-                          FROM pesquisas p
-                         WHERE k.pesquisa_id = p.id
-                           AND {where_proj}
-                           AND p.status = ANY($3::text[])
-                           AND k.status = 'pending'
-                           AND UPPER(COALESCE(k.kw_type, '')) <> 'DESCARTA'""",
-                    *proj_params, list(PESQUISA_STATUS_REVISAVEL),
+                result = await c_lg.execute(
+                    """UPDATE kw_staging SET status = 'approved', updated_at = NOW()
+                        WHERE pesquisa_id = ANY($1::uuid[])
+                          AND status = 'pending'
+                          AND UPPER(COALESCE(kw_type, '')) <> 'DESCARTA'""",
+                    ids_revisaveis,
                 )
                 approved = int(result.split()[-1])
-                skipped_descarta = await conn.fetchval(
-                    f"""SELECT COUNT(*)
-                          FROM kw_staging k
-                          JOIN pesquisas p ON p.id = k.pesquisa_id
-                         WHERE {where_proj}
-                           AND k.status = 'pending'
-                           AND UPPER(COALESCE(k.kw_type, '')) = 'DESCARTA'""",
-                    *proj_params,
+                skipped_descarta = await c_lg.fetchval(
+                    """SELECT COUNT(*) FROM kw_staging
+                        WHERE pesquisa_id = ANY($1::uuid[])
+                          AND status = 'pending'
+                          AND UPPER(COALESCE(kw_type, '')) = 'DESCARTA'""",
+                    ids_projeto,
                 ) or 0
             elif body.approve_ids:
                 aprovaveis: list[int] = []
@@ -358,41 +397,59 @@ async def approve_keywords_plan(projeto_id: str, body: ApprovePlanRequest):
                     else:
                         aprovaveis.append(kid)
                 if aprovaveis:
-                    result = await conn.execute(
+                    result = await c_lg.execute(
                         """UPDATE kw_staging SET status = 'approved', updated_at = NOW()
-                            WHERE id = ANY($1::int[]) AND status <> 'approved'""",
-                        aprovaveis,
+                            WHERE id = ANY($1::int[]) AND status <> 'approved'
+                              AND pesquisa_id = ANY($2::uuid[])""",
+                        aprovaveis, ids_revisaveis,
                     )
                     approved = int(result.split()[-1])
 
-            # ── 4. Subir status das pesquisas tocadas ──
-            pesquisas_atualizadas: list[str] = []
-            if body.aprovar_pesquisas and (approved or body.approve_all_non_descarta):
-                rows = await conn.fetch(
-                    f"""UPDATE pesquisas p
-                           SET status = 'aprovado', reviewed_at = NOW()
-                         WHERE {where_proj}
-                           AND p.status = 'classificado'
-                           AND EXISTS (
-                                 SELECT 1 FROM kw_staging k
-                                  WHERE k.pesquisa_id = p.id AND k.status = 'approved')
-                     RETURNING p.id""",
-                    *proj_params,
-                )
-                pesquisas_atualizadas = [str(r["id"]) for r in rows]
-
-            # ── Saldo ──
-            pending_restantes = await conn.fetchval(
-                f"""SELECT COUNT(*)
-                      FROM kw_staging k
-                      JOIN pesquisas p ON p.id = k.pesquisa_id
-                     WHERE {where_proj}
-                       AND k.status = 'pending'
-                       AND UPPER(COALESCE(k.kw_type, '')) <> 'DESCARTA'""",
-                *proj_params,
+            # ── Candidatas à projeção e saldo — ainda dentro da transação do fato ──
+            # Substituem o `EXISTS (SELECT 1 FROM kw_staging ...)` do UPDATE original e o
+            # COUNT que fechava o handler; as duas contam sobre TODAS as pesquisas.
+            aprovadas_rows = await c_lg.fetch(
+                """SELECT DISTINCT pesquisa_id FROM kw_staging
+                    WHERE pesquisa_id = ANY($1::uuid[]) AND status = 'approved'""",
+                ids_projeto,
+            )
+            pending_restantes = await c_lg.fetchval(
+                """SELECT COUNT(*) FROM kw_staging
+                    WHERE pesquisa_id = ANY($1::uuid[])
+                      AND status = 'pending'
+                      AND UPPER(COALESCE(kw_type, '')) <> 'DESCARTA'""",
+                ids_projeto,
             ) or 0
 
-    return {
+    # ── Bloco B — Postgres: a PROJEÇÃO, fora da transação do Supabase ──
+    pesquisas_atualizadas: list[str] = []
+    aviso: str | None = None
+    if body.aprovar_pesquisas and (approved or body.approve_all_non_descarta):
+        candidatas = [str(r["pesquisa_id"]) for r in aprovadas_rows]
+        try:
+            async with pool.acquire() as c_pg:
+                rows = await c_pg.fetch(
+                    """UPDATE pesquisas SET status = 'aprovado', reviewed_at = NOW()
+                        WHERE id = ANY($1::uuid[]) AND status = 'classificado'
+                    RETURNING id""",
+                    candidatas,
+                )
+            pesquisas_atualizadas = [str(r["id"]) for r in rows]
+        except Exception as e:
+            # Nunca falhar mudo: as keywords JÁ estão aprovadas no Supabase. Sem o nome
+            # da exceção crua nem a connection string na mensagem (T-35-08).
+            print(
+                f"[keywords] WARN: keywords do projeto {projeto_id} aprovadas no Supabase "
+                f"mas a promoção das pesquisas no Postgres falhou: {type(e).__name__}",
+                file=sys.stderr,
+            )
+            aviso = (
+                "As keywords foram aprovadas, mas a sincronização do status das pesquisas "
+                "ficou pendente. Reexecute a aprovação para concluir — a operação é "
+                "idempotente e não duplica efeito."
+            )
+
+    resposta = {
         "approved": approved,
         "rejected": rejected,
         "reclassified": reclassified,
@@ -402,6 +459,11 @@ async def approve_keywords_plan(projeto_id: str, body: ApprovePlanRequest):
         "not_found": sorted(set(not_found)),
         "invalid": invalid,
     }
+    # `aviso` só existe no caminho degradado — no caminho feliz a resposta tem
+    # exatamente as 8 chaves de sempre, nem uma a mais (SC-01).
+    if aviso:
+        resposta["aviso"] = aviso
+    return resposta
 
 
 @router.post("/{projeto_id}/keywords/approve-classified")
@@ -416,51 +478,53 @@ async def approve_classified_keywords(projeto_id: str):
     UPPER(kw_type) != 'DESCARTA'.
 
     Idempotente: rerun encontra 0 rows em pending → approved=0.
+
+    ## Fase 35 / D-02 — mesmo recorte do `/approve`, sem o bloco de projeção
+    ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    Este caminho legado nunca escreveu em `pesquisas` — `pesquisas_atualizadas` aqui é a
+    lista das pesquisas *afetadas*, não das promovidas. Depois do corte ele é, portanto,
+    uma escrita single-DB no Supabase precedida de uma leitura no Postgres: não há falha
+    parcial cross-DB a tratar.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            proj = await _resolve_projeto(conn, projeto_id)
-            pid_int = proj["id_int_legado"]
-            where_proj = _where_projeto(1, 2)
-            params = [projeto_id, pid_int, list(PESQUISA_STATUS_REVISAVEL)]
+        proj = await _resolve_projeto(conn, projeto_id)
+        pmap = await _pesquisas_do_projeto(
+            conn, projeto_id, proj["id_int_legado"], list(PESQUISA_STATUS_REVISAVEL)
+        )
+    ids = list(pmap.keys())
 
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        async with c_lg.transaction():
             # Descobre pesquisas afetadas (antes do UPDATE — depois seriam approved)
-            pesquisas_rows = await conn.fetch(
-                f"""SELECT DISTINCT p.id
-                      FROM pesquisas p
-                      JOIN kw_staging k ON k.pesquisa_id = p.id
-                     WHERE {where_proj}
-                       AND p.status = ANY($3::text[])
-                       AND k.status = 'pending'
-                       AND UPPER(COALESCE(k.kw_type, '')) != 'DESCARTA'""",
-                *params,
+            pesquisas_rows = await c_lg.fetch(
+                """SELECT DISTINCT k.pesquisa_id
+                     FROM kw_staging k
+                    WHERE k.pesquisa_id = ANY($1::uuid[])
+                      AND k.status = 'pending'
+                      AND UPPER(COALESCE(k.kw_type, '')) != 'DESCARTA'""",
+                ids,
             )
-            pesquisas_atualizadas = [str(r["id"]) for r in pesquisas_rows]
+            pesquisas_atualizadas = [str(r["pesquisa_id"]) for r in pesquisas_rows]
 
             # Conta DESCARTA pendentes (skipped)
-            skipped = await conn.fetchval(
-                f"""SELECT COUNT(*)
-                      FROM kw_staging k
-                      JOIN pesquisas p ON p.id = k.pesquisa_id
-                     WHERE {where_proj}
-                       AND p.status = ANY($3::text[])
-                       AND k.status = 'pending'
-                       AND UPPER(COALESCE(k.kw_type, '')) = 'DESCARTA'""",
-                *params,
+            skipped = await c_lg.fetchval(
+                """SELECT COUNT(*) FROM kw_staging k
+                    WHERE k.pesquisa_id = ANY($1::uuid[])
+                      AND k.status = 'pending'
+                      AND UPPER(COALESCE(k.kw_type, '')) = 'DESCARTA'""",
+                ids,
             )
 
             # UPDATE em massa — pré-existência do filtro garante idempotência
-            result = await conn.execute(
-                f"""UPDATE kw_staging AS k
-                       SET status = 'approved', updated_at = NOW()
-                      FROM pesquisas p
-                     WHERE k.pesquisa_id = p.id
-                       AND {where_proj}
-                       AND p.status = ANY($3::text[])
-                       AND k.status = 'pending'
-                       AND UPPER(COALESCE(k.kw_type, '')) != 'DESCARTA'""",
-                *params,
+            result = await c_lg.execute(
+                """UPDATE kw_staging SET status = 'approved', updated_at = NOW()
+                    WHERE pesquisa_id = ANY($1::uuid[])
+                      AND status = 'pending'
+                      AND UPPER(COALESCE(kw_type, '')) != 'DESCARTA'""",
+                ids,
             )
             # asyncpg retorna "UPDATE N"
             approved = int(result.split()[-1])

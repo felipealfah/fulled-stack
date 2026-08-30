@@ -1,10 +1,17 @@
 """REQ-8-03 — POST /projetos/{uuid}/keywords/approve-classified.
 
-Estratégia: cada teste cria pesquisa+kws na base VPS (via túnel local 5434),
-chama a API, valida efeito no banco, cleanup no teardown.
+Estratégia: cada teste cria pesquisa (Postgres) + kws (Supabase), chama a API,
+valida efeito no banco, cleanup no teardown.
+
+## Fase 35 / D-02 — o seed atravessa os dois bancos
+ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+`pesquisas` fica no Postgres da Stack (`db_conn`); `kw_staging` mora no schema `leadgen`
+do Supabase (`lg_conn`). Semear a keyword no banco errado passa silenciosamente.
 
 Pré-condições:
-- Túnel VPS Postgres aberto em localhost:5434.
+- Túnel VPS aberto (`bash Full_AIOS_STACK/vps_tunnel.sh -d`) — Postgres em localhost:5433.
+- `LEADGEN_DB_URL` resolvido pelo conftest.py (Supavisor session pooler).
 - Migration 027 aplicada (UNIQUE natural pesquisas + competitor_audits).
 - AUTH_ENABLED=false (setado no conftest.py).
 
@@ -56,41 +63,52 @@ async def _reset_pool_por_teste():
 
 @pytest.fixture
 async def db_conn():
-    """Conexão asyncpg direta para seed/cleanup."""
+    """Postgres da Stack — camada de decisão (`projetos`, `pesquisas`)."""
     dsn = os.environ["DATABASE_URL"]
     conn = await asyncpg.connect(dsn)
     yield conn
     await conn.close()
 
 
-async def _seed_pesquisa_with_pending_kws(conn, projeto_uuid, projeto_id_int, kws):
-    """Cria pesquisa status='aprovado' + kw_staging pending. Retorna pesquisa_id."""
+@pytest.fixture
+async def lg_conn():
+    """Supabase, schema `leadgen` — camada pré-decisão (`kw_staging`)."""
+    conn = await asyncpg.connect(
+        os.environ["LEADGEN_DB_URL"], server_settings={"search_path": "leadgen"}
+    )
+    yield conn
+    await conn.close()
+
+
+async def _seed_pesquisa_with_pending_kws(conn, lg, projeto_uuid, projeto_id_int, kws):
+    """Cria pesquisa status='aprovado' (Postgres) + kw_staging pending (Supabase)."""
     suffix = uuid.uuid4().hex[:8]
     pid = await conn.fetchval(
         """INSERT INTO pesquisas (projeto_nome, nicho, cidade, status, papel, projeto_id, projeto_id_uuid)
            VALUES ($1, $2, 'Brasília', 'aprovado', 'servico', $3, $4::uuid) RETURNING id""",
-        f"MM Entulho", f"nicho-approve-{suffix}", projeto_id_int, projeto_uuid,
+        "MM Entulho", f"nicho-approve-{suffix}", projeto_id_int, projeto_uuid,
     )
     for kw, kw_type in kws:
-        await conn.execute(
+        await lg.execute(
             """INSERT INTO kw_staging (pesquisa_id, keyword, kw_type, status)
                VALUES ($1::uuid, $2, $3, 'pending')""",
-            pid, kw, kw_type,
+            str(pid), f"{kw}-{suffix}", kw_type,
         )
     return pid
 
 
-async def _cleanup_pesquisa(conn, pesquisa_id):
-    # kw_staging cascateia por FK, mas garantimos DELETE explícito para clareza
-    await conn.execute("DELETE FROM kw_staging WHERE pesquisa_id = $1::uuid", pesquisa_id)
+async def _cleanup_pesquisa(conn, lg, pesquisa_id):
+    """Fase 35: o CASCADE de `pesquisas` → `kw_staging` não atravessa a fronteira dos
+    bancos. O DELETE explícito no Supabase deixou de ser "clareza" e virou obrigação."""
+    await lg.execute("DELETE FROM kw_staging WHERE pesquisa_id = $1::uuid", str(pesquisa_id))
     await conn.execute("DELETE FROM pesquisas WHERE id = $1::uuid", pesquisa_id)
 
 
 @pytest.mark.asyncio
-async def test_approve_classified_happy(db_conn):
+async def test_approve_classified_happy(db_conn, lg_conn):
     """T1: pesquisa 'aprovado' com 3 pending (1 DESCARTA) → approved=2, skipped=1."""
     pid = await _seed_pesquisa_with_pending_kws(
-        db_conn, PROJETO_MM_UUID, PROJETO_MM_INT,
+        db_conn, lg_conn, PROJETO_MM_UUID, PROJETO_MM_INT,
         [("kw-happy-1", "PAGINA_PRINCIPAL"), ("kw-happy-2", "SECAO"), ("kw-happy-3", "DESCARTA")],
     )
     try:
@@ -102,14 +120,14 @@ async def test_approve_classified_happy(db_conn):
         assert body["skipped_descarta"] >= 1, body
         assert str(pid) in body["pesquisas_atualizadas"], body
     finally:
-        await _cleanup_pesquisa(db_conn, pid)
+        await _cleanup_pesquisa(db_conn, lg_conn, pid)
 
 
 @pytest.mark.asyncio
-async def test_approve_classified_idempotent(db_conn):
+async def test_approve_classified_idempotent(db_conn, lg_conn):
     """T2 (CRIT-4): rerun imediato → approved=0."""
     pid = await _seed_pesquisa_with_pending_kws(
-        db_conn, PROJETO_MM_UUID, PROJETO_MM_INT,
+        db_conn, lg_conn, PROJETO_MM_UUID, PROJETO_MM_INT,
         [("kw-idem-1", "PAGINA_PRINCIPAL")],
     )
     try:
@@ -121,7 +139,7 @@ async def test_approve_classified_idempotent(db_conn):
             assert r2.status_code == 200, r2.text
             assert r2.json()["approved"] == 0
     finally:
-        await _cleanup_pesquisa(db_conn, pid)
+        await _cleanup_pesquisa(db_conn, lg_conn, pid)
 
 
 @pytest.mark.asyncio
@@ -155,14 +173,14 @@ async def test_approve_classified_uuid_invalido():
 
 
 @pytest.mark.asyncio
-async def test_approve_classified_skipped_descarta_conta_correto(db_conn):
+async def test_approve_classified_skipped_descarta_conta_correto(db_conn, lg_conn):
     """T6: 3 DESCARTA pending + 5 SECAO pending → approved=5, skipped>=3.
 
     Uso >= porque pode haver outras pesquisas pending no projeto — isolamos
     contando efeito no fixture próprio via query direta ao banco.
     """
     pid = await _seed_pesquisa_with_pending_kws(
-        db_conn, PROJETO_MM_UUID, PROJETO_MM_INT,
+        db_conn, lg_conn, PROJETO_MM_UUID, PROJETO_MM_INT,
         [
             ("kw-desc-1", "DESCARTA"), ("kw-desc-2", "DESCARTA"), ("kw-desc-3", "DESCARTA"),
             ("kw-sec-1", "SECAO"), ("kw-sec-2", "SECAO"), ("kw-sec-3", "SECAO"),
@@ -175,15 +193,15 @@ async def test_approve_classified_skipped_descarta_conta_correto(db_conn):
         assert r.status_code == 200, r.text
 
         # Valida efeito local: dos 8 seeds, 5 SECAO devem estar 'approved', 3 DESCARTA continuam 'pending'
-        approved_local = await db_conn.fetchval(
+        approved_local = await lg_conn.fetchval(
             "SELECT COUNT(*) FROM kw_staging WHERE pesquisa_id = $1::uuid AND status = 'approved'",
-            pid,
+            str(pid),
         )
-        pending_descarta_local = await db_conn.fetchval(
+        pending_descarta_local = await lg_conn.fetchval(
             "SELECT COUNT(*) FROM kw_staging WHERE pesquisa_id = $1::uuid AND status = 'pending' AND UPPER(kw_type) = 'DESCARTA'",
-            pid,
+            str(pid),
         )
         assert approved_local == 5, f"esperado 5 approved locais, tem {approved_local}"
         assert pending_descarta_local == 3, f"DESCARTA deveria continuar pending, tem {pending_descarta_local}"
     finally:
-        await _cleanup_pesquisa(db_conn, pid)
+        await _cleanup_pesquisa(db_conn, lg_conn, pid)
