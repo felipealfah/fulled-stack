@@ -5,8 +5,14 @@ Tabela criada na migration 028 (plan 10-01) — PK natural: projeto_id UUID.
 
 Estratégia: usar Limpa Fossa Brasília (f8b09865...), DELETE preventivo.
 
+## Fase 35 / D-02 — a tabela mora no Supabase (schema `leadgen`)
+O seed/teardown passou de `DATABASE_URL` para `LEADGEN_DB_URL`. `projetos` continua no
+Postgres da Stack, mas este arquivo só o alcança pelo endpoint. O reset do pool do Supabase
+vem da fixture autouse do `conftest.py` (Plan 35-01) — não duplicar aqui.
+
 Pré-condições:
-- Túnel VPS Postgres em localhost:5434.
+- Túnel VPS Postgres em localhost:5433 (`bash vps_tunnel.sh -d`) — resolve `projetos`.
+- `LEADGEN_DB_URL` no `.env` apontando para o Supavisor session pooler.
 - Migration 028 aplicada (tabela backlink_intel).
 - AUTH_ENABLED=false.
 
@@ -86,8 +92,10 @@ async def _reset_pool_por_teste():
 
 @pytest.fixture
 async def db_conn():
-    dsn = os.environ["DATABASE_URL"]
-    conn = await asyncpg.connect(dsn)
+    """Conexão de seed/teardown — Fase 35: `backlink_intel` mora no Supabase."""
+    conn = await asyncpg.connect(
+        os.environ["LEADGEN_DB_URL"], server_settings={"search_path": "leadgen"},
+    )
     yield conn
     await conn.close()
 

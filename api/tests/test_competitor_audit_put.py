@@ -6,9 +6,19 @@ UNIQUE INDEX competitor_audits_projeto_uuid_key criado na migration 027 (plan 10
 Estratégia: usar Limpa Fossa Brasília (f8b09865...) como fixture, DELETE preventivo
 antes de cada teste para começar do zero, cleanup no teardown.
 
+## Fase 35 / D-02 — a tabela mora no Supabase (schema `leadgen`)
+O seed/teardown deixou de escrever em `DATABASE_URL` e passou a usar `LEADGEN_DB_URL`:
+`competitor_audits` não é mais servida pelo Postgres da Stack. `projetos` continua lá, mas
+este arquivo não o toca por SQL — só pelo endpoint. Reset do pool do Supabase vem da fixture
+autouse do `conftest.py` (Plan 35-01); não duplicar aqui.
+
 Pré-condições:
-- Túnel VPS Postgres em localhost:5434.
+- Túnel VPS Postgres em localhost:5433 (`bash vps_tunnel.sh -d`) — resolve `projetos`.
+- `LEADGEN_DB_URL` no `.env` apontando para o Supavisor session pooler.
 - Migration 027 aplicada (UNIQUE projeto_id_uuid em competitor_audits).
+- ⚠️ Migration 034 / 20260830120000 aplicadas (coluna `backlink_benchmark`). Sem elas os 3
+  testes de escrita falham com `UndefinedColumnError` — a coluna nunca existiu em banco
+  nenhum, embora o router a referencie desde a Phase 10. Ver 35-04-SUMMARY.md.
 - AUTH_ENABLED=false.
 
 Rodar:
@@ -78,8 +88,10 @@ async def _reset_pool_por_teste():
 
 @pytest.fixture
 async def db_conn():
-    dsn = os.environ["DATABASE_URL"]
-    conn = await asyncpg.connect(dsn)
+    """Conexão de seed/teardown — Fase 35: `competitor_audits` mora no Supabase."""
+    conn = await asyncpg.connect(
+        os.environ["LEADGEN_DB_URL"], server_settings={"search_path": "leadgen"},
+    )
     yield conn
     await conn.close()
 

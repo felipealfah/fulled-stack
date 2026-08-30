@@ -7,6 +7,23 @@ Ainda popula projeto_id INT legado (NOT NULL) via projetos.id_int_legado.
 Auth via middleware — decisão D-09.
 
 Uso pelo agente `/competitor-audit` após scraping de top 3 concorrentes orgânicos.
+
+## Fase 35 / D-02 — competitor_audits mora no Supabase (schema `leadgen`)
+ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+Handler de dois passos, sem uma linha de SQL alterada:
+  1. `c_pg` (pool do Postgres da Stack) resolve o projeto em `projetos`. Sem FK cross-DB
+     esse passo é o **único** controle de acesso entre projetos (mitigação T-35-05).
+  2. `c_lg` (pool do Supabase) executa o upsert. O `search_path=leadgen` resolve o schema,
+     então o SQL continua dizendo `INTO competitor_audits` sem prefixo.
+
+A transação passou do pool do Postgres para o do Supabase: é lá que a escrita acontece, e
+uma transação aberta no banco que só faz um SELECT não protege nada.
+
+⚠️ `backlink_benchmark` NÃO existe em banco nenhum (nem na origem, nem no Supabase) — o
+INSERT abaixo a referencia desde a Phase 10 e por isso este endpoint responde **500** em
+produção. A migration 034 (Stack) + 20260830120000 (Supabase) criam a coluna; enquanto não
+forem aplicadas, este handler continua quebrado. Ver 35-04-SUMMARY.md § Ação do Board.
 """
 
 import json
@@ -16,6 +33,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from db import get_pool
+from db_leadgen import get_lg_pool
 from routers._common import _resolve_projeto
 
 router = APIRouter(prefix="/projetos", tags=["competitor-audit"])
@@ -48,31 +66,38 @@ async def upsert_competitor_audit(projeto_id: str, body: CompetitorAuditPayload)
 
     ON CONFLICT (projeto_id_uuid) DO UPDATE — retry produz mesmo estado no banco.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    # Fase 35 / D-02: passo 1 — o projeto é resolvido no Postgres da Stack (camada de
+    # decisão). É o controle que impede o `projeto_id` do path chegar cru ao Supabase.
+    # O pool do Supabase só é aberto DEPOIS: 404/422/500 de projeto continuam corretos
+    # mesmo com o Supabase fora do ar, e a ordem fica demonstrável (T-35-05).
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
+    pid_int = proj["id_int_legado"]
+    pid_uuid = str(proj["id"])
+    if pid_int is None:
+        raise HTTPException(
+            500,
+            "Projeto sem id_int_legado — competitor_audits.projeto_id é NOT NULL",
+        )
+
+    try:
+        # `Z` sufixo virou compatível com fromisoformat em 3.11+, mas normalizamos
+        # para robustez com clientes que mandem "2026-07-24T18:00:00Z"
+        generated_at = datetime.fromisoformat(body.generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(422, "generated_at deve ser ISO 8601")
+
+    # Coluna competitor_audits.generated_at é TIMESTAMP (sem TZ).
+    # asyncpg falha ao encodar datetime aware contra TIMESTAMP — remover tz
+    # (assumido UTC pelo cliente que padroniza ISO 8601 com Z ou offset explícito).
+    if generated_at.tzinfo is not None:
+        generated_at = generated_at.astimezone(timezone.utc).replace(tzinfo=None)
+
+    # Fase 35 / D-02: passo 2 — todo o SQL de `competitor_audits` roda no Supabase.
+    lg = await get_lg_pool()
+    async with lg.acquire() as conn:
         async with conn.transaction():
-            proj = await _resolve_projeto(conn, projeto_id)
-            pid_int = proj["id_int_legado"]
-            pid_uuid = str(proj["id"])
-            if pid_int is None:
-                raise HTTPException(
-                    500,
-                    "Projeto sem id_int_legado — competitor_audits.projeto_id é NOT NULL",
-                )
-
-            try:
-                # `Z` sufixo virou compatível com fromisoformat em 3.11+, mas normalizamos
-                # para robustez com clientes que mandem "2026-07-24T18:00:00Z"
-                generated_at = datetime.fromisoformat(body.generated_at.replace("Z", "+00:00"))
-            except ValueError:
-                raise HTTPException(422, "generated_at deve ser ISO 8601")
-
-            # Coluna competitor_audits.generated_at é TIMESTAMP (sem TZ).
-            # asyncpg falha ao encodar datetime aware contra TIMESTAMP — remover tz
-            # (assumido UTC pelo cliente que padroniza ISO 8601 com Z ou offset explícito).
-            if generated_at.tzinfo is not None:
-                generated_at = generated_at.astimezone(timezone.utc).replace(tzinfo=None)
-
             gaps = body.market_gaps
             row = await conn.fetchrow(
                 """

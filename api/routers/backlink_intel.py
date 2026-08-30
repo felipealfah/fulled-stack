@@ -6,6 +6,20 @@ PK natural: projeto_id UUID. ON CONFLICT (projeto_id) DO UPDATE.
 Auth via middleware — decisão D-09.
 
 Uso pelo agente `/backlink-intel` após scraping do Apify Backlinks Checker.
+
+## Fase 35 / D-02 — backlink_intel mora no Supabase (schema `leadgen`)
+ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+Handler de dois passos, sem uma linha de SQL alterada:
+  1. `c_pg` (pool do Postgres da Stack) resolve o projeto em `projetos` — único controle de
+     acesso entre projetos agora que não há FK cross-DB (mitigação T-35-05).
+  2. `c_lg` (pool do Supabase) executa o upsert; o `search_path=leadgen` resolve o schema.
+
+A transação passou para o pool do Supabase, onde a escrita de fato acontece.
+
+⚠️ D-06: `backlink_intel.projeto_id` tinha `ON DELETE CASCADE` para `projetos` (medido no
+banco vivo: `backlink_intel_projeto_id_fkey`, confdeltype='c'). Esse cascade não existe mais
+— `DELETE /projetos/{uuid}` apaga esta linha explicitamente (ver `projetos.delete_projeto`).
 """
 
 import json
@@ -15,6 +29,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from db import get_pool
+from db_leadgen import get_lg_pool
 from routers._common import _resolve_projeto
 
 router = APIRouter(prefix="/projetos", tags=["backlink-intel"])
@@ -56,17 +71,23 @@ async def upsert_backlink_intel(projeto_id: str, body: BacklinkIntelPayload):
 
     ON CONFLICT (projeto_id) DO UPDATE — retry produz mesmo estado no banco.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    # Fase 35 / D-02: passo 1 — projeto resolvido no Postgres da Stack (camada de decisão).
+    # O pool do Supabase só abre DEPOIS desta resolução e da validação do payload: 404 e 422
+    # continuam corretos com o Supabase fora do ar, o que torna a ordem demonstrável (T-35-05).
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
+    pid_uuid = str(proj["id"])
+
+    try:
+        generated_at = datetime.fromisoformat(body.generated_at)
+    except ValueError:
+        raise HTTPException(422, "generated_at deve ser ISO 8601")
+
+    # Fase 35 / D-02: passo 2 — todo o SQL de `backlink_intel` roda no Supabase.
+    lg = await get_lg_pool()
+    async with lg.acquire() as conn:
         async with conn.transaction():
-            proj = await _resolve_projeto(conn, projeto_id)
-            pid_uuid = str(proj["id"])
-
-            try:
-                generated_at = datetime.fromisoformat(body.generated_at)
-            except ValueError:
-                raise HTTPException(422, "generated_at deve ser ISO 8601")
-
             row = await conn.fetchrow(
                 """
                 INSERT INTO backlink_intel
