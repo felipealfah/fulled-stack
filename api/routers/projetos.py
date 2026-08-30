@@ -8,6 +8,9 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from db import get_pool
+from db_leadgen import get_lg_pool
+from routers._common import _resolve_projeto
+
 router = APIRouter(prefix="/projetos", tags=["projetos"])
 
 _SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -332,24 +335,84 @@ async def update_projeto(projeto_id: str, body: ProjetoUpdate):
     return dict(updated)
 
 
+# Fase 35 / D-06: as 6 tabelas que tinham `ON DELETE CASCADE` para `projetos` e mudaram de
+# banco. Conferido no catálogo do Postgres vivo (`pg_constraint.confdeltype = 'c'`), não na
+# lista do plano — que omitia `backlink_intel`.
+#
+# A coluna difere: `backlink_intel` referencia o projeto por `projeto_id` (a PK natural da
+# tabela); as outras cinco por `projeto_id_uuid`.
+#
+# NÃO entram aqui `projeto_seo_plan_pages` e `projeto_seo_plan_pages_intel`: as FKs delas
+# apontam para dentro do próprio schema `leadgen` e continuam sendo cascade de banco de
+# verdade — apagar `projeto_seo_plan` já as leva junto.
+_TABELAS_CASCADE_PERDIDO = (
+    ("competitor_audits", "projeto_id_uuid"),
+    ("content_pages", "projeto_id_uuid"),
+    ("projeto_geo_targets", "projeto_id_uuid"),
+    ("projeto_seo_plan", "projeto_id_uuid"),
+    ("rank_intel_overrides", "projeto_id_uuid"),
+    ("backlink_intel", "projeto_id"),
+)
+
+
 @router.delete("/{projeto_id}")
 async def delete_projeto(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id FROM projetos WHERE id = $1", projeto_id
-        )
-        if not row:
-            raise HTTPException(404, "Projeto não encontrado")
+    """Apaga o projeto e tudo que dependia dele.
 
-        # D-16: nullifica projeto_id_uuid nas pesquisas antes de deletar
-        await conn.execute(
-            "UPDATE pesquisas SET projeto_id_uuid = NULL WHERE projeto_id_uuid = $1",
-            projeto_id,
+    ## Fase 35 / D-06 — o cascade do banco não existe mais
+    ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    Antes, um único `DELETE FROM projetos` disparava 6 `ON DELETE CASCADE`. Essas 6 tabelas
+    moram agora no Supabase e não há FK atravessando a fronteira dos bancos: sem limpeza
+    explícita o delete passaria a deixar lixo invisível, que só apareceria meses depois como
+    dado fantasma. As três etapas abaixo são ordenadas de propósito.
+
+    Filhos primeiro, projeto por último: a intenção do endpoint é destrutiva, então uma
+    falha no passo 3 deixa o projeto vivo **sem** filhos, e reexecutar o `DELETE` converge
+    (o passo 2 vira no-op). A ordem inversa deixaria órfãos permanentes e invisíveis.
+    """
+    # Passo 1 — resolver o projeto no Postgres (camada de decisão). 404/422 em pt-BR.
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        proj = await _resolve_projeto(c_pg, projeto_id)
+    pid_uuid = str(proj["id"])
+
+    # Passo 2 — Fase 35 / D-06: apagar os filhos no Supabase, numa transação só.
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
+        async with c_lg.transaction():
+            for tabela, coluna in _TABELAS_CASCADE_PERDIDO:
+                # noqa S608: identificadores vêm de _TABELAS_CASCADE_PERDIDO (constante
+                # do módulo), nunca de entrada do usuário; o único valor continua
+                # parametrizado em $1 (T-35-06). É o caso de "SET dinâmico" que o
+                # CLAUDE.md abre como exceção — nome de coluna por f-string, valor nunca.
+                await c_lg.execute(
+                    f"DELETE FROM {tabela} WHERE {coluna} = $1::uuid", pid_uuid,  # noqa: S608
+                )
+
+    # Passo 3 — só então o Postgres.
+    try:
+        async with pg.acquire() as c_pg:
+            async with c_pg.transaction():
+                # D-16: nullifica projeto_id_uuid nas pesquisas antes de deletar
+                await c_pg.execute(
+                    "UPDATE pesquisas SET projeto_id_uuid = NULL WHERE projeto_id_uuid = $1::uuid",
+                    pid_uuid,
+                )
+                await c_pg.execute("DELETE FROM projetos WHERE id = $1::uuid", pid_uuid)
+    except Exception as e:
+        # Nunca falhar mudo: os filhos já foram apagados e o projeto continua de pé.
+        print(
+            f"[projetos] WARN: filhos de uuid={pid_uuid} apagados no Supabase mas o DELETE "
+            f"no Postgres falhou: {type(e).__name__}",
+            file=sys.stderr,
         )
-        await conn.execute(
-            "DELETE FROM projetos WHERE id = $1", projeto_id
+        raise HTTPException(
+            500,
+            "Os dados dependentes do projeto foram apagados, mas o projeto em si não pôde "
+            "ser removido. Reexecute o DELETE para concluir — a operação é idempotente.",
         )
+
     return {"ok": True}
 
 
@@ -474,11 +537,24 @@ async def get_audit(projeto_id: str):
 
 @router.get("/{projeto_id}/competitor-audit")
 async def get_competitor_audit(projeto_id: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    """Leitura do competitor_audit do projeto.
+
+    Fase 35 / D-02: única leitura de tabela migrada neste arquivo. O `SELECT id FROM
+    projetos` continua no Postgres; o SELECT de `competitor_audits` passou ao Supabase.
+
+    ⚠️ Este SELECT referencia `backlink_benchmark`, coluna que nunca existiu em banco
+    nenhum — o endpoint responde 500 até a migration 034 (Stack) / 20260830120000
+    (Supabase) serem aplicadas. Ver 35-04-SUMMARY.md § Ação do Board.
+    """
+    pg = await get_pool()
+    async with pg.acquire() as conn:
         projeto = await conn.fetchrow("SELECT id FROM projetos WHERE id = $1", projeto_id)
         if not projeto:
             raise HTTPException(404, "Projeto não encontrado")
+
+    # Fase 35 / D-02: o SQL não mudou — só o pool. search_path=leadgen resolve o schema.
+    lg = await get_lg_pool()
+    async with lg.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT slug, keyword_principal, generated_at, competitor_count,
                       benchmark_word_count, required_sections, schema_missing,
