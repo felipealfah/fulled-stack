@@ -4,6 +4,9 @@ _resolve_projeto: hoje vive em seo_plan.py. Extraído aqui para os routers
 novos da Phase 10 (keywords, competitor_audit, backlink_intel, rank_tracking)
 não copiarem a mesma implementação 4 vezes.
 
+_pesquisas_do_projeto: composição cross-DB da Fase 35 — devolve as pesquisas do
+projeto (Postgres) já no formato que o filtro `= ANY($1::uuid[])` do Supabase consome.
+
 _load_gcp_key: auto-detecta base64 ou JSON puro numa env var de SA GCP.
 No .env-prod da VPS as chaves ficam em base64 (evita quebra de quotes/newlines
 no Portainer stack.env). No worker/.env local ficam em JSON single-line.
@@ -70,6 +73,47 @@ async def _resolve_projeto_id_int(conn, projeto_id: str) -> int:
             "rode o backfill da Phase 05 antes de usar este endpoint.",
         )
     return id_int
+
+
+async def _pesquisas_do_projeto(
+    conn_pg,
+    projeto_id: str,
+    pid_int: int | None,
+    statuses: list[str] | None = None,
+) -> dict[str, dict]:
+    """Resolve as pesquisas do projeto no Postgres da Stack.
+
+    Fase 35 / D-02 — ADR
+    Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+    `pesquisas` é camada de decisão e **não** migrou; `kw_staging` migrou. O JOIN que
+    ligava as duas deixou de ser possível, então a condição de projeto passa a ser
+    resolvida aqui, e o resultado alimenta o `= ANY($1::uuid[])` do lado Supabase.
+
+    Devolve `{pesquisa_id_str: dict(row)}` com `id`, `papel`, `nicho` e `status` — as
+    mesmas colunas que o JOIN fornecia. A chave é o UUID em texto, no formato canônico
+    que o `::text` do Postgres também produz do outro lado.
+
+    `statuses=None` significa **sem filtro de status** — e não "nenhum status". Os
+    handlers do Gate de Keywords precisam das duas leituras: `skipped_descarta` e
+    `pending_restantes` contam sobre TODAS as pesquisas do projeto, enquanto a aprovação
+    só alcança as revisáveis. Passar a lista errada muda contagem que o Board lê.
+
+    Chamar SEMPRE no pool do Postgres (`conn_pg`) e SEMPRE antes de tocar o Supabase:
+    sem FK cross-DB esta resolução é o único controle que impede travessia entre
+    projetos (T-35-05).
+    """
+    rows = await conn_pg.fetch(
+        """SELECT id, papel, nicho, status
+             FROM pesquisas
+            WHERE (projeto_id_uuid = $1::uuid
+                   OR ($2::int IS NOT NULL AND projeto_id = $2::int))
+              AND ($3::text[] IS NULL OR status = ANY($3::text[]))""",
+        projeto_id,
+        pid_int,
+        list(statuses) if statuses is not None else None,
+    )
+    return {str(r["id"]): dict(r) for r in rows}
 
 
 def _load_gcp_key(env_name: str) -> dict | None:

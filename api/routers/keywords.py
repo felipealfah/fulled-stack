@@ -12,15 +12,27 @@ todo projeto criado após a migração UUID (Phase 05) — retornando HTTP 200 c
 tracking (que filtra status='approved') coletava zero keywords do projeto.
 Os testes não pegaram porque o fixture seedava projeto_id INT explicitamente.
 
-Correção: todo filtro por projeto agora casa `projeto_id_uuid = $uuid OR projeto_id = $int`
-via o helper `_where_projeto()`. Migration 032 reparou os dados existentes.
+Correção: todo filtro por projeto casa `projeto_id_uuid = $uuid OR projeto_id = $int`.
+Migration 032 reparou os dados existentes.
+
+## Fase 35 / D-02 e D-06 — `kw_staging` mora no Supabase, `pesquisas` fica no Postgres
+ADR: Full_AIOS_LEADGEN/inteligence/decisoes/2026-08-29_Migracao_LeadGen_Postgres_Supabase.md
+
+Este é o arquivo que mais atravessa a fronteira dos dois bancos, e o único da fase que
+**escreve** nos dois. O `_where_projeto()` — fragmento SQL que casava a pesquisa pelo
+UUID ou pelo INT legado dentro de um JOIN `kw_staging × pesquisas` — dá lugar a
+`_common._pesquisas_do_projeto()`, que roda no Postgres e devolve a lista de
+`pesquisa_id`. Do lado do Supabase toda query filtra por
+`pesquisa_id = ANY($1::uuid[])` com parâmetro posicional — nunca por concatenação de ids
+(T-35-06) e nunca por valor vindo do corpo da requisição (T-35-05).
 """
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from db import get_pool
-from routers._common import _resolve_projeto
+from db_leadgen import get_lg_pool
+from routers._common import _pesquisas_do_projeto, _resolve_projeto
 from routers.kw_mgmt import ALLOWED_KW_TYPES
 
 router = APIRouter(prefix="/projetos", tags=["keywords"])
@@ -34,11 +46,39 @@ def _where_projeto(uuid_param: int, int_param: int) -> str:
 
     Recebe os NÚMEROS dos placeholders asyncpg (ex.: 1 e 2 → "$1"/"$2").
     O INT pode ser NULL — `$2::int IS NOT NULL AND` protege o comparativo.
+
+    Fase 35: só resta em uso no Gate de aprovação, migrado logo em seguida — some do
+    arquivo quando o último JOIN cross-fronteira sair.
     """
     return (
         f"(p.projeto_id_uuid = ${uuid_param}::uuid"
         f" OR (${int_param}::int IS NOT NULL AND p.projeto_id = ${int_param}::int))"
     )
+
+
+def _listagem_vazia() -> dict:
+    """Payload de GET /keywords quando nenhuma pesquisa do projeto entra no filtro.
+
+    Devolvido **sem tocar no Supabase** — o `= ANY(ARRAY[]::uuid[])` casaria zero linhas
+    de qualquer jeito, e não abrir o pool mantém 404/422 independentes do Supabase estar
+    de pé. Instância nova a cada chamada: dicionário de módulo compartilhado é mutável.
+    """
+    return {"total": 0, "items": [], "resumo": {"por_status": {}, "por_kw_type": {}}}
+
+
+def _e_uuid_malformado(e: Exception) -> bool:
+    """Distingue 'o parâmetro não é UUID' de qualquer outra falha do banco.
+
+    Duas formas aparecem, e o código antigo só reconhecia a primeira:
+      - `invalid input syntax for type uuid` — o servidor rejeitou o texto;
+      - `invalid input for query argument $N: ... (invalid UUID ...)` — o **asyncpg**
+        rejeitou no bind, antes de ir à rede, porque o cast `::uuid` deixa o tipo do
+        parâmetro conhecido. É o caso real de `?pesquisa_id=nao-e-uuid`, que respondia
+        500 (medido antes da Fase 35).
+    Mesma forma adotada em `kw_mgmt.py` e `intel.py`.
+    """
+    msg = str(e).lower()
+    return "invalid input syntax" in msg or "invalid uuid" in msg
 
 
 class ReclassifyItem(BaseModel):
@@ -90,65 +130,82 @@ async def list_projeto_keywords(
     Retorna: {total, items, resumo: {por_status, por_kw_type}}
     O resumo ignora limit/offset — é a contagem do filtro inteiro, que a tela
     do Board usa para os contadores das abas sem precisar paginar tudo.
+
+    ## Fase 35 / D-02 — duas consultas e um casamento em memória
+    O JOIN `kw_staging × pesquisas` deixou de ser possível. Passo 1 no Postgres:
+    quais pesquisas do projeto entram (é aqui que o filtro `papel` passa a agir, porque
+    `papel` é coluna de `pesquisas`). Passo 2 no Supabase: as keywords dessas pesquisas,
+    com os filtros de `kw_staging`, o `total`, o `ORDER BY` e a paginação intactos em
+    SQL. As colunas que vinham do JOIN são preenchidas em memória, **na mesma posição**
+    do SELECT — a ordem das chaves do item é contrato observável (SC-01).
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         proj = await _resolve_projeto(conn, projeto_id)
+        # `statuses=None`: este endpoint nunca filtrou por status de pesquisa.
+        pmap = await _pesquisas_do_projeto(conn, projeto_id, proj["id_int_legado"])
 
-        where = [_where_projeto(1, 2)]
-        params: list = [projeto_id, proj["id_int_legado"]]
-        n = 3
+    if papel:
+        pmap = {pid: row for pid, row in pmap.items() if row["papel"] == papel}
 
-        if status:
-            if status.startswith("!"):
-                where.append(f"ks.status <> ${n}")
-                params.append(status[1:])
-            else:
-                where.append(f"ks.status = ${n}")
-                params.append(status)
-            n += 1
+    if not pmap:
+        return _listagem_vazia()
 
-        if kw_type:
-            # Case-insensitive dos dois lados: projetos legacy gravaram kw_type
-            # em lowercase ('principal', 'geo'…) antes da normalização.
-            if kw_type.startswith("!"):
-                where.append(f"UPPER(COALESCE(ks.kw_type, '')) <> UPPER(${n})")
-                params.append(kw_type[1:])
-            else:
-                where.append(f"UPPER(COALESCE(ks.kw_type, '')) = UPPER(${n})")
-                params.append(kw_type)
-            n += 1
+    # $1 é sempre a lista de pesquisas; os filtros dinâmicos começam em $2.
+    where = ["ks.pesquisa_id = ANY($1::uuid[])"]
+    params: list = [list(pmap.keys())]
+    n = 2
 
-        if pesquisa_id:
-            where.append(f"p.id = ${n}::uuid")
-            params.append(pesquisa_id)
-            n += 1
+    if status:
+        if status.startswith("!"):
+            where.append(f"ks.status <> ${n}")
+            params.append(status[1:])
+        else:
+            where.append(f"ks.status = ${n}")
+            params.append(status)
+        n += 1
 
-        if papel:
-            where.append(f"p.papel = ${n}")
-            params.append(papel)
-            n += 1
+    if kw_type:
+        # Case-insensitive dos dois lados: projetos legacy gravaram kw_type
+        # em lowercase ('principal', 'geo'…) antes da normalização.
+        if kw_type.startswith("!"):
+            where.append(f"UPPER(COALESCE(ks.kw_type, '')) <> UPPER(${n})")
+            params.append(kw_type[1:])
+        else:
+            where.append(f"UPPER(COALESCE(ks.kw_type, '')) = UPPER(${n})")
+            params.append(kw_type)
+        n += 1
 
-        if q:
-            where.append(f"ks.keyword ILIKE ${n}")
-            params.append(f"%{q}%")
-            n += 1
+    if pesquisa_id:
+        # `pesquisa_id` é coluna da própria `kw_staging` — continua no SQL do Supabase.
+        # A interseção com `ANY($1)` reproduz o que o JOIN garantia: um id de outro
+        # projeto simplesmente não casa (T-35-05).
+        where.append(f"ks.pesquisa_id = ${n}::uuid")
+        params.append(pesquisa_id)
+        n += 1
 
-        where_sql = " AND ".join(where)
-        base_from = "FROM kw_staging ks JOIN pesquisas p ON p.id = ks.pesquisa_id"
+    if q:
+        where.append(f"ks.keyword ILIKE ${n}")
+        params.append(f"%{q}%")
+        n += 1
 
+    where_sql = " AND ".join(where)
+    base_from = "FROM kw_staging ks"
+
+    lg = await get_lg_pool()
+    async with lg.acquire() as c_lg:
         try:
-            total = await conn.fetchval(
+            total = await c_lg.fetchval(
                 f"SELECT COUNT(*) {base_from} WHERE {where_sql}", *params
             )
 
-            rows = await conn.fetch(
+            rows = await c_lg.fetch(
                 f"""SELECT ks.id, ks.keyword, ks.kw_type, ks.status,
                            ks.avg_monthly_searches, ks.competition, ks.competition_index,
                            ks.bid_pos5_8_brl, ks.bid_pos1_4_brl, ks.score, ks.go_nogo,
                            ks.competitive_score, ks.difficulty_label, ks.board_note,
-                           p.id::text AS pesquisa_id, p.papel, p.nicho,
-                           p.status AS pesquisa_status
+                           ks.pesquisa_id::text AS pesquisa_id, NULL::text AS papel,
+                           NULL::text AS nicho, NULL::text AS pesquisa_status
                     {base_from}
                    WHERE {where_sql}
                    ORDER BY ks.avg_monthly_searches DESC NULLS LAST, ks.id ASC
@@ -156,28 +213,41 @@ async def list_projeto_keywords(
                 *params, limit, offset,
             )
 
-            resumo_status = await conn.fetch(
+            resumo_status = await c_lg.fetch(
                 f"SELECT ks.status, COUNT(*) AS n {base_from} WHERE {where_sql} GROUP BY 1",
                 *params,
             )
-            resumo_tipo = await conn.fetch(
+            resumo_tipo = await c_lg.fetch(
                 f"""SELECT UPPER(COALESCE(ks.kw_type, '')) AS kw_type, COUNT(*) AS n
                     {base_from} WHERE {where_sql} GROUP BY 1""",
                 *params,
             )
         except Exception as e:
-            if "invalid input syntax" in str(e).lower():
+            if _e_uuid_malformado(e):
                 raise HTTPException(422, "pesquisa_id não é um UUID válido")
             raise
 
-        return {
-            "total": total,
-            "items": [dict(r) for r in rows],
-            "resumo": {
-                "por_status": {r["status"]: r["n"] for r in resumo_status},
-                "por_kw_type": {r["kw_type"]: r["n"] for r in resumo_tipo},
-            },
-        }
+    # As 4 colunas que o JOIN trazia: `pesquisa_id` já veio de `kw_staging`; as outras
+    # três vêm do dicionário do Postgres. `.get()` porque, sem FK cross-DB, uma keyword
+    # órfã deixou de ser impossível — melhor devolver nulo do que estourar KeyError.
+    vazio: dict = {}
+    items = []
+    for r in rows:
+        item = dict(r)
+        pesq = pmap.get(item["pesquisa_id"], vazio)
+        item["papel"] = pesq.get("papel")
+        item["nicho"] = pesq.get("nicho")
+        item["pesquisa_status"] = pesq.get("status")
+        items.append(item)
+
+    return {
+        "total": total,
+        "items": items,
+        "resumo": {
+            "por_status": {r["status"]: r["n"] for r in resumo_status},
+            "por_kw_type": {r["kw_type"]: r["n"] for r in resumo_tipo},
+        },
+    }
 
 
 @router.post("/{projeto_id}/keywords/approve")
