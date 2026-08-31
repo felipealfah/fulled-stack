@@ -106,14 +106,13 @@ export interface Rastro {
 // ── Tipo para contagens do header ─────────────────────────────────────────────
 
 export type OfertasCounts = Record<OfertaStatus, number> & {
-  infoapp: number
   arquivo: number
 }
 
 // ── Helpers de query ──────────────────────────────────────────────────────────
 
 /**
- * Retorna contagens por status + infoapp + arquivo (descartada+saturada+pausada).
+ * Retorna contagens por status + arquivo (descartada+saturada+pausada).
  */
 export async function fetchOfertasCounts(): Promise<OfertasCounts> {
   // Buscar contagens por status
@@ -134,7 +133,6 @@ export async function fetchOfertasCounts(): Promise<OfertasCounts> {
     saturada: 0,
     pausada: 0,
     candidata: 0,
-    infoapp: 0,
     arquivo: 0,
   }
 
@@ -148,17 +146,6 @@ export async function fetchOfertasCounts(): Promise<OfertasCounts> {
 
   // Arquivo = descartada + saturada + pausada
   counts.arquivo = counts.descartada + counts.saturada + counts.pausada
-
-  // Contar infoapp (exceto descartadas)
-  const { count: infoappCount, error: infoappErr } = await supabaseLT
-    .from('ofertas')
-    .select('*', { count: 'exact', head: true })
-    .eq('oportunidade_infoapp', true)
-    .neq('status', 'descartada')
-
-  if (infoappErr) throw infoappErr
-
-  counts.infoapp = infoappCount ?? 0
 
   return counts
 }
@@ -281,22 +268,6 @@ export async function fetchCandidatasTracker(): Promise<TrackerRow[]> {
 
   if (error) throw error
   return (data ?? []) as TrackerRow[]
-}
-
-/**
- * Retorna ofertas com oportunidade_infoapp=true exceto descartadas,
- * ordenadas por atualizado_em DESC.
- */
-export async function fetchInfoapp(): Promise<Oferta[]> {
-  const { data, error } = await supabaseLT
-    .from('ofertas')
-    .select('*')
-    .eq('oportunidade_infoapp', true)
-    .neq('status', 'descartada')
-    .order('atualizado_em', { ascending: false })
-
-  if (error) throw error
-  return (data ?? []) as Oferta[]
 }
 
 /**

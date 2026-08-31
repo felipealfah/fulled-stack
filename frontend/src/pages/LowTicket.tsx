@@ -10,7 +10,6 @@ import {
   fetchSparklines,
   fetchCandidatas,
   fetchCandidatasTracker,
-  fetchInfoapp,
   fetchArquivo,
   fetchRastros,
   insertRastro,
@@ -49,7 +48,7 @@ const STATUS_CFG = {
 
 // ── Tipo das abas ─────────────────────────────────────────────────────────────
 
-type Aba = 'gate' | 'tracker' | 'candidatas' | 'infoapp' | 'arquivo' | 'rastros' | 'blacklist'
+type Aba = 'gate' | 'tracker' | 'candidatas' | 'arquivo' | 'rastros' | 'blacklist'
 
 // ── Helpers de formatação ─────────────────────────────────────────────────────
 
@@ -128,7 +127,6 @@ function PainelAnalise({ oferta, onClose, onSaved }: PainelAnaliseProps) {
       setSaveError(null)
       queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
-      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
       queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
       onSaved()
     },
@@ -148,7 +146,6 @@ function PainelAnalise({ oferta, onClose, onSaved }: PainelAnaliseProps) {
       queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
       queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
-      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
       queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
       setConfirmDialog(null)
       onClose()
@@ -163,7 +160,6 @@ function PainelAnalise({ oferta, onClose, onSaved }: PainelAnaliseProps) {
       queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
       queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
-      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
       queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
       setConfirmDialog(null)
       onClose()
@@ -613,7 +609,6 @@ function ModalBloquearAnunciante({ anunciante, onClose, onSuccess }: ModalBloque
       if (varrer) {
         afetadas = await bloquearOfertasAnunciante(anunciante.trim(), tipo)
         queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
-        queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
         queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
         queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       }
@@ -745,7 +740,6 @@ function BlacklistTab() {
       if (varrerAoAdicionar) {
         afetadas = await bloquearOfertasAnunciante(padrao, novoTipo)
         queryClient.invalidateQueries({ queryKey: ['lt-gate'] })
-        queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
         queryClient.invalidateQueries({ queryKey: ['lt-candidatas'] })
         queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
       }
@@ -1843,295 +1837,6 @@ function CandidatasTab() {
   )
 }
 
-// ── Aba Infoapp (FR-6) ────────────────────────────────────────────────────────
-
-function InfoappTab() {
-  const queryClient = useQueryClient()
-  const [selectedOferta, setSelectedOferta] = useState<Oferta | null>(null)
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  const [bulkConfirm, setBulkConfirm] = useState<'monitorar' | 'descartar' | null>(null)
-  const [bloquearTarget, setBloquearTarget] = useState<string | null>(null)
-  const [toastMsg, setToastMsg] = useState<string | null>(null)
-
-  const { data: ofertas, isLoading, error } = useQuery({
-    queryKey: ['lt-infoapp'],
-    queryFn: fetchInfoapp,
-    staleTime: 30_000,
-  })
-
-  // Manter selecionada sincronizada com dados atualizados
-  const selectedOfertaAtualizada = useMemo(() => {
-    if (!selectedOferta || !ofertas) return selectedOferta
-    return ofertas.find(o => o.id === selectedOferta.id) ?? selectedOferta
-  }, [selectedOferta, ofertas])
-
-  const iis = useSort<'n_anuncios_ativos'|'dias_ativo_oferta'|'nicho'|'mercado'|'preco_visivel'|'formato_entregavel'|'tipo_funil'>('n_anuncios_ativos', 'desc')
-  const ofertasOrdenadas = useMemo(() => {
-    if (!ofertas) return []
-    return sortRows(ofertas, iis.key as keyof Oferta, iis.dir)
-  }, [ofertas, iis.key, iis.dir])
-
-  const bulkMonitorarMutation = useMutation({
-    mutationFn: () => Promise.all(
-      Array.from(selectedIds).map(id =>
-        updateOferta(id, { status: 'monitorando', data_inicio_monitoramento: new Date().toISOString().split('T')[0] })
-      )
-    ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
-      queryClient.invalidateQueries({ queryKey: ['lt-tracker'] })
-      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
-      setSelectedOferta(prev => (prev && selectedIds.has(prev.id) ? null : prev))
-      setSelectedIds(new Set())
-      setBulkConfirm(null)
-    },
-  })
-
-  const bulkDescartarMutation = useMutation({
-    mutationFn: () => Promise.all(
-      Array.from(selectedIds).map(id => updateOferta(id, { status: 'descartada' }))
-    ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['lt-infoapp'] })
-      queryClient.invalidateQueries({ queryKey: ['lt-counts'] })
-      setSelectedOferta(prev => (prev && selectedIds.has(prev.id) ? null : prev))
-      setSelectedIds(new Set())
-      setBulkConfirm(null)
-    },
-  })
-
-  const bulkActing = bulkMonitorarMutation.isPending || bulkDescartarMutation.isPending
-
-  function toggleId(id: string) {
-    setSelectedIds(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id); else next.add(id)
-      return next
-    })
-  }
-
-  function toggleAll() {
-    const allIds = ofertasOrdenadas.map(o => o.id)
-    const allSelected = allIds.length > 0 && allIds.every(id => selectedIds.has(id))
-    setSelectedIds(allSelected ? new Set() : new Set(allIds))
-  }
-
-  if (isLoading) {
-    return <p className="text-gray-600 text-sm font-mono py-12 text-center">Carregando...</p>
-  }
-  if (error) {
-    return <p className="text-red-400 text-sm font-mono py-12 text-center">Erro ao carregar.</p>
-  }
-  if (!ofertas || ofertas.length === 0) {
-    return <p className="text-gray-600 font-mono text-sm py-8 text-center">Nenhuma oferta infoapp no momento.</p>
-  }
-
-  return (
-    <div className="flex flex-col gap-3">
-      {/* Barra de seleção em lote */}
-      {selectedIds.size > 0 && (
-        <div className="flex items-center gap-3 bg-gray-900 border border-violet-500/30 rounded-xl px-4 py-2.5 flex-wrap">
-          <span className="text-sm font-mono text-violet-300">
-            {selectedIds.size} selecionado{selectedIds.size !== 1 ? 's' : ''}
-          </span>
-          <div className="flex gap-2 ml-auto flex-wrap">
-            <button
-              onClick={() => setBulkConfirm('monitorar')}
-              disabled={bulkActing}
-              className="text-xs font-mono px-3 py-1.5 rounded-lg bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-600/30 transition-colors disabled:opacity-50 whitespace-nowrap"
-            >
-              Monitorar {selectedIds.size}
-            </button>
-            <button
-              onClick={() => setBulkConfirm('descartar')}
-              disabled={bulkActing}
-              className="text-xs font-mono px-3 py-1.5 rounded-lg bg-red-700/20 text-red-400 border border-red-500/30 hover:bg-red-700/30 transition-colors disabled:opacity-50 whitespace-nowrap"
-            >
-              Descartar {selectedIds.size}
-            </button>
-            <button
-              onClick={() => setSelectedIds(new Set())}
-              className="text-xs font-mono px-2 py-1.5 text-gray-600 hover:text-gray-400 transition-colors"
-            >
-              ✕ limpar
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Layout: tabela + painel */}
-      <div className={selectedOfertaAtualizada ? 'flex gap-4 items-start' : ''}>
-      <div className={`overflow-x-auto rounded-xl border border-gray-800 ${selectedOfertaAtualizada ? 'flex-1 min-w-0' : ''}`}>
-        <table className="w-full text-sm font-mono">
-          <thead>
-            <tr className="border-b border-gray-800 bg-gray-900/60">
-              <th className="px-3 py-3 w-8">
-                <input
-                  type="checkbox"
-                  checked={ofertasOrdenadas.length > 0 && ofertasOrdenadas.every(o => selectedIds.has(o.id))}
-                  onChange={toggleAll}
-                  className="accent-violet-500 w-4 h-4 cursor-pointer"
-                />
-              </th>
-              <th className="px-4 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Anunciante</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Mix</th>
-              <SortTh col="n_anuncios_ativos"  label="Ativos"   active={iis.key==='n_anuncios_ativos'}  dir={iis.dir} onSort={() => iis.sort('n_anuncios_ativos', true)} />
-              <SortTh col="dias_ativo_oferta"  label="Dias"     active={iis.key==='dias_ativo_oferta'}  dir={iis.dir} onSort={() => iis.sort('dias_ativo_oferta', true)} />
-              <SortTh col="nicho"              label="Nicho"    active={iis.key==='nicho'}              dir={iis.dir} onSort={() => iis.sort('nicho')} />
-              <SortTh col="mercado"            label="Mercado"  active={iis.key==='mercado'}            dir={iis.dir} onSort={() => iis.sort('mercado')} />
-              <SortTh col="preco_visivel"      label="Preço"    active={iis.key==='preco_visivel'}      dir={iis.dir} onSort={() => iis.sort('preco_visivel')} />
-              <SortTh col="formato_entregavel" label="Formato"  active={iis.key==='formato_entregavel'} dir={iis.dir} onSort={() => iis.sort('formato_entregavel')} />
-              <SortTh col="tipo_funil"         label="Funil"    active={iis.key==='tipo_funil'}         dir={iis.dir} onSort={() => iis.sort('tipo_funil')} />
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Status</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider whitespace-nowrap">Atualizado</th>
-              <th className="px-3 py-3 text-left text-xs text-gray-500 uppercase tracking-wider">Lib</th>
-              <th className="px-3 py-3 w-8"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {ofertasOrdenadas.map((o: Oferta) => {
-              const isSelected = selectedOfertaAtualizada?.id === o.id
-              const isChecked = selectedIds.has(o.id)
-              return (
-              <tr
-                key={o.id}
-                className={`border-b border-gray-800/60 hover:bg-gray-800/30 transition-colors ${
-                  isSelected ? 'bg-violet-500/5 border-l-2 border-l-violet-500' : ''
-                } ${isChecked ? 'bg-violet-950/20' : ''}`}
-              >
-                <td className="px-3 py-3 w-8">
-                  <input
-                    type="checkbox"
-                    checked={isChecked}
-                    onChange={() => toggleId(o.id)}
-                    className="accent-violet-500 w-4 h-4 cursor-pointer"
-                  />
-                </td>
-                <td className="px-4 py-3 max-w-[160px]">
-                  <button
-                    onClick={() => setSelectedOferta(prev => (prev?.id === o.id ? null : o))}
-                    className="flex items-center gap-1.5 text-left w-full hover:text-violet-300 transition-colors"
-                  >
-                    {o.vertical_risco && <span className="text-red-400 shrink-0" title="Vertical de risco">⚠️</span>}
-                    <span className="truncate text-gray-200">{o.anunciante ?? '—'}</span>
-                  </button>
-                </td>
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
-                  {fmtMix(o.n_criativos_video, o.n_criativos_imagem)}
-                </td>
-                <td className="px-3 py-3 text-gray-300">{o.n_anuncios_ativos ?? '—'}</td>
-                <td className="px-3 py-3 text-gray-400">{o.dias_ativo_oferta ?? '—'}</td>
-                <td className="px-3 py-3 text-gray-400 max-w-[120px]">
-                  <span className="truncate block">{o.nicho ?? '—'}</span>
-                </td>
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.mercado ?? '—'}</td>
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.preco_visivel ?? '—'}</td>
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">
-                  <span className="text-amber-400 mr-1">⭐</span>
-                  {o.formato_entregavel ?? '—'}
-                </td>
-                <td className="px-3 py-3 text-gray-400 whitespace-nowrap">{o.tipo_funil ?? '—'}</td>
-                <td className="px-3 py-3">
-                  <StatusChip status={o.status} />
-                </td>
-                <td className="px-3 py-3 text-gray-600 text-xs whitespace-nowrap">
-                  {fmtDate(o.atualizado_em)}
-                </td>
-                <td className="px-3 py-3">
-                  {o.link_ad_library ? (
-                    <a
-                      href={o.link_ad_library}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs font-mono text-violet-400 hover:text-violet-300 border border-violet-500/30 px-2 py-1 rounded transition-colors whitespace-nowrap"
-                    >
-                      Biblioteca
-                    </a>
-                  ) : (
-                    <span className="text-gray-700 text-xs">—</span>
-                  )}
-                </td>
-
-                {/* Bloquear anunciante */}
-                <td className="px-3 py-3">
-                  <button
-                    onClick={e => { e.stopPropagation(); setBloquearTarget(o.anunciante ?? '') }}
-                    title="Bloquear anunciante"
-                    className="text-gray-600 hover:text-red-400 transition-colors text-base"
-                  >
-                    🚫
-                  </button>
-                </td>
-              </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Painel lateral de análise */}
-      {selectedOfertaAtualizada && (
-        <PainelAnalise
-          oferta={selectedOfertaAtualizada}
-          onClose={() => setSelectedOferta(null)}
-          onSaved={() => {
-            // painel permanece aberto após salvar
-          }}
-        />
-      )}
-      </div>
-      <p className="text-xs font-mono text-gray-700">
-        {ofertas.length} oferta{ofertas.length !== 1 ? 's' : ''} infoapp
-      </p>
-
-      {/* Modal bloquear anunciante */}
-      {bloquearTarget !== null && bloquearTarget !== '' && (
-        <ModalBloquearAnunciante
-          anunciante={bloquearTarget}
-          onClose={() => setBloquearTarget(null)}
-          onSuccess={msg => { setBloquearTarget(null); setToastMsg(msg) }}
-        />
-      )}
-      {toastMsg && <Toast message={toastMsg} onDismiss={() => setToastMsg(null)} />}
-
-      {/* Confirm em lote */}
-      {bulkConfirm !== null && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-80 flex flex-col gap-4">
-            <p className="text-sm font-mono text-gray-200">
-              Confirmar:{' '}
-              <span className={bulkConfirm === 'monitorar' ? 'text-emerald-400' : 'text-red-400'}>
-                {bulkConfirm === 'monitorar' ? 'Monitorar' : 'Descartar'}
-              </span>{' '}
-              {selectedIds.size} oferta{selectedIds.size !== 1 ? 's' : ''}?
-            </p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => bulkConfirm === 'monitorar' ? bulkMonitorarMutation.mutate() : bulkDescartarMutation.mutate()}
-                disabled={bulkActing}
-                className={`flex-1 font-mono text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-60 ${
-                  bulkConfirm === 'monitorar'
-                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
-                    : 'bg-red-700/80 hover:bg-red-700 text-white'
-                }`}
-              >
-                {bulkActing ? 'Aguarde...' : 'Confirmar'}
-              </button>
-              <button
-                onClick={() => setBulkConfirm(null)}
-                disabled={bulkActing}
-                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 font-mono text-sm px-4 py-2 rounded-lg transition-colors"
-              >
-                Cancelar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
 // ── Aba Arquivo (FR-7) ────────────────────────────────────────────────────────
 
 const ARQUIVO_STATUS_OPTS: Array<{ value: OfertaStatus | ''; label: string }> = [
@@ -2752,7 +2457,7 @@ export function LowTicket() {
   type TileKey = {
     key: Aba
     label: string
-    status?: keyof typeof STATUS_CFG | 'arquivo' | 'infoapp'
+    status?: keyof typeof STATUS_CFG | 'arquivo'
     cls: string
   }
 
@@ -2760,7 +2465,6 @@ export function LowTicket() {
     { key: 'gate',       label: 'Gate',        cls: 'text-amber-400' },
     { key: 'tracker',    label: 'Monitorando', cls: 'text-emerald-400' },
     { key: 'candidatas', label: 'Candidatas',  cls: 'text-violet-400' },
-    { key: 'infoapp',    label: '⭐ Infoapp',  cls: 'text-amber-300' },
     { key: 'arquivo',    label: 'Arquivo',     cls: 'text-gray-500' },
     { key: 'rastros',    label: 'Rastros',     cls: 'text-gray-400' },
     { key: 'blacklist',  label: '🚫 Blacklist', cls: 'text-red-500' },
@@ -2771,7 +2475,6 @@ export function LowTicket() {
       case 'gate':       return counts ? (counts.alerta ?? 0) + (counts.em_analise_funil ?? 0) : 0
       case 'tracker':    return counts ? (counts.monitorando ?? 0) + (counts.em_escala ?? 0) : 0
       case 'candidatas': return counts ? counts.candidata ?? 0 : 0
-      case 'infoapp':    return counts ? counts.infoapp ?? 0 : 0
       case 'arquivo':    return counts ? counts.arquivo ?? 0 : 0
       case 'rastros':    return rastrosCount ?? 0
       case 'blacklist':  return blacklistCount ?? 0
@@ -2783,7 +2486,6 @@ export function LowTicket() {
     { key: 'gate',       label: 'Gate' },
     { key: 'tracker',    label: 'Tracker' },
     { key: 'candidatas', label: 'Candidatas' },
-    { key: 'infoapp',    label: 'Infoapp' },
     { key: 'arquivo',    label: 'Arquivo' },
     { key: 'rastros',    label: 'Rastros' },
     { key: 'blacklist',  label: '🚫 Blacklist' },
@@ -2856,7 +2558,6 @@ export function LowTicket() {
         {aba === 'gate'       && <GateTab />}
         {aba === 'tracker'    && <TrackerTab />}
         {aba === 'candidatas' && <CandidatasTab />}
-        {aba === 'infoapp'    && <InfoappTab />}
         {aba === 'arquivo'    && <ArquivoTab />}
         {aba === 'rastros'    && <RastrosTab />}
         {aba === 'blacklist'  && <BlacklistTab />}
