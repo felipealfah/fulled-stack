@@ -1,8 +1,6 @@
 __pycache__/
 *.py[cod]
-.env
-*.env
-.env-prod
+.env*
 .DS_Store
 node_modules/
 dist/

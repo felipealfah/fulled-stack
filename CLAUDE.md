@@ -21,6 +21,29 @@ docker compose logs -f fastapi    # logs da API
 
 Requer `.env` (ver `.env.example`).
 
+## Arquitetura de features — fatia vertical
+
+Cada nova feature vive em `backend/app/features/<nome>/` com 5 arquivos obrigatórios:
+
+```
+domain.py       — regra de negócio pura. ZERO imports de FastAPI, asyncpg, SQLAlchemy.
+schema.py       — modelos Pydantic. Tipos com | (str | None), nunca Optional[str].
+repository.py   — queries asyncpg parametrizadas ($1/$2). dict(row) antes de retornar.
+service.py      — orquestra domain + repository. Sem imports de FastAPI aqui.
+routes.py       — FastAPI router. Prefixo: /<nome>. Erros em pt-BR.
+tests/          — pytest cobrindo regras de domínio. Testar domain.py sem banco.
+```
+
+Regras invioláveis:
+- Fonte externa (n8n, scraping) → obrigatoriamente `POST /<nome>/ingest` → banco. Nunca direto.
+- `domain.py` sem imports de framework — testável puro Python.
+- Features não importam outras features.
+- Credenciais via `.env`, nunca hardcoded.
+
+Após criar a feature: incluir o router em `backend/app/main.py`. Para features com UI, criar `frontend/src/pages/<Nome>.tsx` e registrar rota em `App.tsx`.
+
+---
+
 ## Conventions
 
 ### Python (api/)
