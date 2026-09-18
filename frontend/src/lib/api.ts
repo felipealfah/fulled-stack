@@ -315,9 +315,31 @@ export interface RankingHistoryResponse {
   message?: string
 }
 
+/** Total REAL do Search Console em 28 dias (dimensão `date` apenas).
+ *
+ * Distinto da soma por keyword de RankingResponse: aquela vem do breakdown por
+ * query, que o Google poda (omite queries raras por privacidade) e por isso é
+ * estruturalmente MENOR que o total real.
+ */
+export interface SearchConsoleTotaisResponse {
+  status: 'ok' | 'not_ready'
+  projeto_id?: string
+  dominio?: string
+  clicks_28d?: number | null
+  impressions_28d?: number | null
+  ctr_28d?: number | null
+  position_avg_28d?: number | null
+  updated_at?: string | null
+  message?: string
+}
+
 export const rankingApi = {
   get: (projetoId: string) =>
     api.get<RankingResponse>(`/projetos/${projetoId}/ranking`).then(r => r.data),
+  totais: (projetoId: string) =>
+    api.get<SearchConsoleTotaisResponse>(
+      `/projetos/${projetoId}/search-console/totais`
+    ).then(r => r.data),
   refresh: (projetoId: string) =>
     api.post<{ status: string; message: string }>(`/projetos/${projetoId}/rank-intel`).then(r => r.data),
   listOverrides: (projetoId: string) =>

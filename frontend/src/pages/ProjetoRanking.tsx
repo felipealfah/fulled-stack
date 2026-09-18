@@ -440,6 +440,16 @@ export function ProjetoRanking() {
     },
   })
 
+  // Total REAL do Search Console (28d) — número de projeto, não de keyword.
+  // Nunca derruba a página: `not_ready`, erro ou carregando simplesmente não
+  // renderizam o card (o early-return de not_ready do ranking principal segue intocado).
+  const { data: totais } = useQuery({
+    queryKey: ['sc-totais', id],
+    queryFn: () => rankingApi.totais(id!),
+    enabled: !!id,
+    staleTime: 5 * 60 * 1000,
+  })
+
   const { data: overrides = [] } = useQuery({
     queryKey: ['ranking-overrides', id],
     queryFn: () => rankingApi.listOverrides(id!),
@@ -608,6 +618,41 @@ export function ProjetoRanking() {
       </div>
 
       <div className="max-w-7xl mx-auto px-6 py-4">
+        {/* Total real do Search Console — fica ACIMA das abas para valer nas três */}
+        {totais?.status === 'ok' && (
+          <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 mb-4">
+            <p className="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-2">
+              Search Console — total real do site · 28 dias
+            </p>
+            <div className="flex flex-wrap items-baseline gap-x-8 gap-y-2">
+              <p className="font-mono text-2xl text-emerald-400">
+                {fmtNum(totais.clicks_28d)}
+                <span className="text-sm text-gray-600"> cliques</span>
+              </p>
+              <p className="font-mono text-2xl text-emerald-400">
+                {fmtNum(totais.impressions_28d)}
+                <span className="text-sm text-gray-600"> impressões</span>
+              </p>
+              <p className="font-mono text-xs text-gray-500">
+                CTR {totais.ctr_28d != null ? `${(totais.ctr_28d * 100).toFixed(1)}%` : '—'}
+                {' · '}
+                Posição média {totais.position_avg_28d != null ? Math.round(totais.position_avg_28d) : '—'}
+              </p>
+            </div>
+            <p className="font-mono text-[10px] text-amber-400/90 mt-3">
+              A soma por keyword da tabela abaixo é MENOR que este total: o Google omite as
+              queries mais raras do detalhamento por consulta, por privacidade. Este número
+              vem da coleta por data, sem quebra por query — é o mesmo que o Search Console
+              reporta.
+            </p>
+            {totais.updated_at && (
+              <p className="font-mono text-[10px] text-gray-700 mt-1" title={totais.updated_at}>
+                rollup atualizado em {new Date(totais.updated_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' })}
+              </p>
+            )}
+          </div>
+        )}
+
         {/* Tab buttons */}
         <div className="flex gap-2 mb-4 border-b border-gray-800 pb-3">
           <button
