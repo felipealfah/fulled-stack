@@ -28,6 +28,7 @@ Se projeto nao existir: 404
 """
 
 import re
+import sys
 import unicodedata
 from pathlib import Path
 from typing import Optional
@@ -35,9 +36,12 @@ from typing import Optional
 import asyncpg
 import pandas as pd
 from fastapi import APIRouter, HTTPException
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 from db import get_pool
 from db_leadgen import get_lg_pool
+from routers._common import _load_gcp_key
 
 router = APIRouter(prefix="/projetos", tags=["ranking"])
 
@@ -47,6 +51,48 @@ _NOT_READY_MSG = (
     "Ranking ainda não sincronizado. O sync n8n (BQ → Postgres) roda diariamente "
     "às 05:00 — ou execute o workflow '[LEADGEN] Sync Gold → Postgres' manualmente."
 )
+
+# ── Totais reais do Search Console (leitura ao vivo do BigQuery) ─────────────
+# D-04: este endpoint NÃO passa pelo cache Postgres/Supabase dos outros handlers
+# deste arquivo. A tabela gold tem uma linha por projeto e é lida direto do BQ
+# com a mesma SA (GCP_SC_KEY) que rank_tracking.py já usa no container fastapi.
+_BQ_PROJECT = "gifted-slice-357413"
+# Tabela lida por get_search_console_totais:
+#   gifted-slice-357413.leadgen_gold.projeto_search_console_totais
+# O nome NÃO vive numa constante interpolada na query de propósito: a query é uma
+# string 100% literal, sem f-string nenhuma, para que nem o ruff (S608) nem um
+# leitor humano precisem decidir se há montagem dinâmica de SQL aqui.
+_BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
+_bq_client: bigquery.Client | None = None
+
+_TOTAIS_NOT_READY_MSG = (
+    "Totais reais do Search Console ainda não disponíveis para este projeto. "
+    "O rollup diário roda no workflow n8n '[LEADGEN] Coleta+Silver SearchConsole' "
+    "(nó de MERGE dos totais por projeto, 04:30) — ou execute-o manualmente."
+)
+
+
+def _get_bq_client() -> bigquery.Client | None:
+    """Retorna singleton BQ client ou None se GCP_SC_KEY não estiver configurada.
+
+    Padrão idêntico ao de rank_tracking.py — replicado aqui para isolamento do
+    router (a mesma escolha que aquele arquivo documenta).
+    """
+    global _bq_client
+    if _bq_client is not None:
+        return _bq_client
+    key_info = _load_gcp_key("GCP_SC_KEY")
+    if not key_info:
+        return None
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            key_info, scopes=_BQ_SCOPES
+        )
+        _bq_client = bigquery.Client(project=_BQ_PROJECT, credentials=credentials)
+        return _bq_client
+    except Exception as e:
+        print(f"[WARN] Erro inicializando BQ client ranking totais: {e}", file=sys.stderr)
+        return None
 
 
 def _slugify(name: str) -> str:
@@ -406,6 +452,82 @@ async def get_ranking_report(projeto_id: str):
             "message": "Histórico de ranking ainda não disponível. Execute rank_intel ao menos uma vez.",
         }
     return _compute_report([dict(r) for r in hist_rows], projeto_id_int, row["projeto_nome"])
+
+
+@router.get("/{projeto_id}/search-console/totais")
+async def get_search_console_totais(projeto_id: str):
+    """Total REAL de cliques/impressões do Search Console em 28 dias.
+
+    Por que existe ao lado de `/ranking`: os dois medem coisas diferentes.
+    `/ranking` soma o breakdown por keyword (leadgen_silver.search_console_daily,
+    dimensões page+query+date) e é ESTRUTURALMENTE MENOR que a realidade — o
+    Google omite silenciosamente as queries muito raras nesse recorte, por
+    privacidade. Este endpoint lê o rollup da coleta com dimensão `date` apenas,
+    que bate com o número que o Search Console reporta ao Board.
+    ADR: Full_AIOS_Data/decisoes/2026-09-18_Search_Console_Totais_Reais_Paralelo_ao_Breakdown.md
+
+    Nunca 500 por causa do BigQuery: sem credencial, sem tabela ou sem linha para
+    o projeto, a resposta é `{"status": "not_ready", ...}` com 200 — a página de
+    ranking não pode quebrar por causa deste card.
+    """
+    # Passo 1 — projeto resolvido no Postgres da Stack (camada de decisão).
+    # Vem ANTES de qualquer consulta ao BQ: sem FK cross-DB, esta resolução é o
+    # único controle de acesso entre projetos (mesma mitigação T-35-05 dos
+    # handlers vizinhos deste arquivo).
+    pg = await get_pool()
+    async with pg.acquire() as c_pg:
+        row = await c_pg.fetchrow(
+            "SELECT projeto_nome, id_int_legado, metadata->>'dominio' AS dominio FROM projetos WHERE id = $1",
+            projeto_id,
+        )
+        if not row:
+            raise HTTPException(404, "Projeto não encontrado")
+
+    projeto_id_int = row["id_int_legado"]
+    if projeto_id_int is None:
+        return {"status": "not_ready", "message": _TOTAIS_NOT_READY_MSG}
+
+    client = _get_bq_client()
+    if client is None:
+        return {"status": "not_ready", "message": _TOTAIS_NOT_READY_MSG}
+
+    # Passo 2 — BigQuery. O projeto_id entra SOMENTE como parâmetro tipado
+    # (T-IIH-01): nenhuma parte do valor toca a string de SQL.
+    query = """
+        SELECT dominio, sc_clicks_28d, sc_impressions_28d,
+               sc_ctr_28d, sc_position_avg_28d, updated_at
+        FROM `gifted-slice-357413.leadgen_gold.projeto_search_console_totais`
+        WHERE projeto_id = @projeto_id
+        LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("projeto_id", "INT64", int(projeto_id_int))
+        ]
+    )
+    try:
+        rows = list(client.query(query, job_config=job_config).result())
+    except Exception as e:
+        print(f"[WARN] Falha lendo totais SC no BQ: {e}", file=sys.stderr)
+        return {"status": "not_ready", "message": _TOTAIS_NOT_READY_MSG}
+
+    if not rows:
+        return {"status": "not_ready", "message": _TOTAIS_NOT_READY_MSG}
+
+    r = rows[0]
+    updated_at = r["updated_at"]
+    return {
+        "status": "ok",
+        "projeto_id": projeto_id,
+        "dominio": r["dominio"] or row["dominio"],
+        "clicks_28d": None if r["sc_clicks_28d"] is None else int(r["sc_clicks_28d"]),
+        "impressions_28d": None if r["sc_impressions_28d"] is None else int(r["sc_impressions_28d"]),
+        "ctr_28d": None if r["sc_ctr_28d"] is None else float(r["sc_ctr_28d"]),
+        "position_avg_28d": (
+            None if r["sc_position_avg_28d"] is None else float(r["sc_position_avg_28d"])
+        ),
+        "updated_at": updated_at.isoformat() if updated_at is not None else None,
+    }
 
 
 @router.get("/{projeto_id}/seo-yaml-template")
