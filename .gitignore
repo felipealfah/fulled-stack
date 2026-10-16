@@ -8,3 +8,5 @@ dist/
 *.log
 graphify-out/
 .rename_test*
+.planning/
+.spec/
